@@ -32,15 +32,27 @@ SOURCE_TZ = timezone(timedelta(hours=9))
 DAILY_POST_LIMIT = max(1, int(os.environ.get("DAILY_POST_LIMIT", "10")))
 SOURCE_SCAN_MAX_PAGES = max(1, int(os.environ.get("SOURCE_SCAN_MAX_PAGES", "60")))
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
+DESTINATION_SCAN_MAX_PAGES = max(1, int(os.environ.get("DESTINATION_SCAN_MAX_PAGES", "80")))
 
 # 중복 게시 방지 (False로 설정하면 이미 올린 글은 건너뜀)
 FORCE_UPDATE = False
+IMAGE_MODE = os.environ.get("IMAGE_MODE", "featured_only").strip().lower()
+VALID_IMAGE_MODES = {"featured_only", "body_only", "both", "none"}
+UPDATE_EXISTING = os.environ.get("UPDATE_EXISTING", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 class NewsTranslator:
     def __init__(self):
         self.translator = Translator()
         self.wordpress_api = f"{WORDPRESS_URL}/wp-json/wp/v2"
         self.posted_articles = self.load_posted_articles()
+        self.destination_post_map = {}
+        self.destination_map_loaded = False
+        if IMAGE_MODE not in VALID_IMAGE_MODES:
+            print(f"⚠️ IMAGE_MODE='{IMAGE_MODE}'는 지원되지 않아 featured_only로 처리합니다.")
+            self.image_mode = "featured_only"
+        else:
+            self.image_mode = IMAGE_MODE
+        self.update_existing = UPDATE_EXISTING
         
     def load_posted_articles(self):
         """이미 게시된 기사 목록 로드"""
@@ -121,6 +133,70 @@ class NewsTranslator:
             local_dt.strftime("%Y-%m-%dT%H:%M:%S"),
             gmt_dt.strftime("%Y-%m-%dT%H:%M:%S"),
         )
+
+    def extract_source_link_from_post_content(self, rendered_html):
+        """대상 사이트 게시글 본문에서 원문 링크 추출"""
+        if not rendered_html:
+            return ""
+        try:
+            soup = BeautifulSoup(rendered_html, 'lxml')
+            for anchor in soup.find_all('a', href=True):
+                href = self.normalize_source_url(anchor['href'])
+                domain = urlparse(href).netloc.lower()
+                if domain == 'jp.pronews.com':
+                    return href
+        except Exception:
+            return ""
+        return ""
+
+    def load_destination_post_map(self):
+        """proDG 기존 게시글에서 원문 링크→게시글 ID 맵 구성"""
+        if self.destination_map_loaded:
+            return
+
+        print("🔎 기존 게시글 인덱스 로딩 중...")
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; proDG-bot/1.0)"}
+
+        for page in range(1, DESTINATION_SCAN_MAX_PAGES + 1):
+            try:
+                params = {
+                    "per_page": 100,
+                    "page": page,
+                    "orderby": "date",
+                    "order": "desc",
+                    "_fields": "id,content",
+                }
+                res = requests.get(
+                    f"{self.wordpress_api}/posts",
+                    params=params,
+                    auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT
+                )
+                if res.status_code == 400:
+                    break
+                res.raise_for_status()
+                posts = res.json()
+                if not posts:
+                    break
+
+                for post in posts:
+                    source_link = self.extract_source_link_from_post_content(
+                        post.get("content", {}).get("rendered", "")
+                    )
+                    if source_link and source_link not in self.destination_post_map:
+                        self.destination_post_map[source_link] = post.get("id")
+            except Exception as e:
+                print(f"⚠️ 기존 게시글 인덱스 로딩 실패 (page={page}): {e}")
+                break
+
+        self.destination_map_loaded = True
+        print(f"   ✅ 인덱싱 완료: {len(self.destination_post_map)}개 원문 링크")
+
+    def find_existing_post_id(self, source_link):
+        """원문 링크 기반으로 기존 게시글 ID 조회"""
+        self.load_destination_post_map()
+        return self.destination_post_map.get(source_link)
         
     def fetch_source_articles(self):
         """원문 WordPress API에서 최신순 기사 수집 (미게시 우선)"""
@@ -164,7 +240,7 @@ class NewsTranslator:
                         continue
                     seen_links.add(link)
 
-                    if not FORCE_UPDATE and link in self.posted_articles:
+                    if not FORCE_UPDATE and not self.update_existing and link in self.posted_articles:
                         continue
 
                     title_html = post.get("title", {}).get("rendered", "")
@@ -401,6 +477,34 @@ class NewsTranslator:
                 print(f"   상세: {e.response.text[:300]}")
             return False
 
+    def update_post_to_wordpress(self, post_id, title, content, featured_media_id, article_date):
+        """기존 워드프레스 포스트 업데이트"""
+        post_date, post_date_gmt = self.to_wordpress_dates(article_date)
+        post_data = {
+            'title': title,
+            'content': content,
+            'status': 'publish',
+            'featured_media': featured_media_id if featured_media_id else 0,
+            'date': post_date,
+            'date_gmt': post_date_gmt
+        }
+
+        try:
+            res = requests.post(
+                f"{self.wordpress_api}/posts/{post_id}",
+                auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
+                json=post_data
+            )
+            res.raise_for_status()
+            post_info = res.json()
+            print(f"♻️ 업데이트 성공! 링크: {post_info['link']}")
+            return True
+        except Exception as e:
+            print(f"❌ 업데이트 실패: {e}")
+            if hasattr(e, 'response'):
+                print(f"   상세: {e.response.text[:300]}")
+            return False
+
     def process_article(self, article):
         """기사 하나 처리: 스크래핑 → 번역 → 이미지 → 게시"""
         print(f"\n{'='*70}")
@@ -446,12 +550,15 @@ class NewsTranslator:
         else:
             print("   ℹ️  이미지 없음")
 
-        # 4. 본문 구성 (이미지 삽입 + 원본 링크)
+        # 4. 본문 구성
         final_content = ""
         normalized_source_link = self.normalize_source_url(article["link"])
-        
-        # 이미지가 있으면 본문 최상단에 삽입
-        if uploaded_img_url:
+
+        use_featured_image = self.image_mode in {"featured_only", "both"}
+        use_body_image = self.image_mode in {"body_only", "both"}
+
+        # 본문 이미지 모드일 때만 상단 삽입
+        if uploaded_img_url and use_body_image:
             final_content += f'<figure style="margin: 0 0 30px 0;">'
             final_content += f'<img src="{uploaded_img_url}" alt="{title_ko}" style="width:100%; height:auto; display:block;" />'
             final_content += f'</figure>\n\n'
@@ -473,11 +580,33 @@ class NewsTranslator:
         final_content += f"</p>"
         
         # 5. 워드프레스에 게시
-        print(f"📤 워드프레스 게시 중...")
-        if self.post_to_wordpress(title_ko, final_content, featured_id, article["date"]):
+        existing_post_id = self.find_existing_post_id(normalized_source_link) if self.update_existing else None
+        final_featured_id = featured_id if use_featured_image else 0
+
+        if existing_post_id:
+            print(f"📤 기존 글 업데이트 중... (ID: {existing_post_id})")
+            action_ok = self.update_post_to_wordpress(
+                existing_post_id,
+                title_ko,
+                final_content,
+                final_featured_id,
+                article["date"]
+            )
+        else:
+            print(f"📤 워드프레스 신규 게시 중...")
+            action_ok = self.post_to_wordpress(
+                title_ko,
+                final_content,
+                final_featured_id,
+                article["date"]
+            )
+
+        if action_ok:
             if not FORCE_UPDATE:
                 self.posted_articles.add(normalized_source_link)
                 self.save_posted_articles()
+            if self.update_existing and existing_post_id:
+                self.destination_post_map[normalized_source_link] = existing_post_id
             return True
         return False
 
@@ -486,6 +615,8 @@ class NewsTranslator:
         print(f"\n{'🚀'*35}")
         print(f"  pronews.jp 자동 번역 시스템 시작")
         print(f"  실행 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"  IMAGE_MODE: {self.image_mode}")
+        print(f"  UPDATE_EXISTING: {self.update_existing}")
         print(f"{'🚀'*35}\n")
         
         # 환경 변수 확인
