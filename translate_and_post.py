@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 pronews.jp 자동 번역 및 워드프레스 게시 시스템
-- 소스: jp.pronews.com/feed
+- 소스: jp.pronews.com WordPress API
 - 번역: Google Translate (일본어 → 한국어)
 - 게시: prodg.kr WordPress
 - 기능: 전체 본문 스크래핑, 이미지 본문 삽입
@@ -10,8 +10,7 @@ pronews.jp 자동 번역 및 워드프레스 게시 시스템
 import os
 import sys
 import requests
-import feedparser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import time
@@ -19,6 +18,7 @@ from urllib.parse import urlparse, urljoin
 from googletrans import Translator
 import html2text
 from bs4 import BeautifulSoup
+import re
 
 # ==========================================
 # 설정 (Settings)
@@ -26,8 +26,12 @@ from bs4 import BeautifulSoup
 WORDPRESS_URL = "https://prodg.kr"
 WORDPRESS_USER = os.environ.get("WP_USER")
 WORDPRESS_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD")
-PRONEWS_RSS = "https://jp.pronews.com/feed"
+PRONEWS_POSTS_API = "https://jp.pronews.com/wp-json/wp/v2/posts"
 POSTED_ARTICLES_FILE = "posted_articles.json"
+SOURCE_TZ = timezone(timedelta(hours=9))
+DAILY_POST_LIMIT = max(1, int(os.environ.get("DAILY_POST_LIMIT", "10")))
+SOURCE_SCAN_MAX_PAGES = max(1, int(os.environ.get("SOURCE_SCAN_MAX_PAGES", "60")))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
 
 # 중복 게시 방지 (False로 설정하면 이미 올린 글은 건너뜀)
 FORCE_UPDATE = False
@@ -43,47 +47,153 @@ class NewsTranslator:
         if Path(POSTED_ARTICLES_FILE).exists():
             with open(POSTED_ARTICLES_FILE, 'r') as f:
                 try:
-                    return json.load(f)
-                except:
-                    return []
-        return []
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        return set(data)
+                    if isinstance(data, dict):
+                        return set(data.keys())
+                    return set()
+                except Exception:
+                    return set()
+        return set()
         
     def save_posted_articles(self):
         """게시된 기사 목록 저장"""
         with open(POSTED_ARTICLES_FILE, 'w') as f:
-            json.dump(self.posted_articles, f, indent=2)
-        
-    def fetch_rss_feed(self):
-        """RSS 피드 가져오기"""
-        print(f"📡 RSS 피드 확인 중: {PRONEWS_RSS}")
-        feed = feedparser.parse(PRONEWS_RSS)
-        
-        # 24시간 이내 기사만
-        limit_date = datetime.now() - timedelta(days=1)
-        recent_articles = []
-        
-        print(f"🔍 총 {len(feed.entries)}개의 피드 항목 검색 시작...")
+            json.dump(sorted(self.posted_articles), f, indent=2, ensure_ascii=False)
 
-        for entry in feed.entries[:20]:  # 최신 20개 체크
-            # 중복 체크
-            if not FORCE_UPDATE and entry.link in self.posted_articles:
-                print(f"  ⏭️  Pass (이미 게시됨): {entry.title}")
-                continue
-                
-            try:
-                article_date = datetime(*entry.published_parsed[:6])
-            except:
-                article_date = datetime.now()
-                
-            if article_date > limit_date:
-                recent_articles.append({
-                    'title': entry.title,
-                    'link': entry.link,
-                    'date': article_date
-                })
+    def normalize_source_url(self, raw_url):
+        """원문 도메인을 jp.pronews.com으로 정규화"""
+        if not raw_url:
+            return ""
+
+        normalized = raw_url.strip()
+        if not normalized.startswith(("http://", "https://")):
+            normalized = f"https://{normalized.lstrip('/')}"
+
+        parsed = urlparse(normalized)
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+
+        if netloc in {"pronews.jp", "www.pronews.jp", "ko.pronews.com"}:
+            netloc = "jp.pronews.com"
+
+        rebuilt = parsed._replace(netloc=netloc).geturl()
+        return rebuilt
+
+    def normalize_pronews_domains_in_text(self, text):
+        """번역 중 잘못 바뀐 pronews 도메인 복구"""
+        if not text:
+            return text
+
+        fixed = text
+        fixed = re.sub(r"https?://ko\.pronews\.com", "https://jp.pronews.com", fixed)
+        fixed = re.sub(r"https?://(?:www\.)?pronews\.jp", "https://jp.pronews.com", fixed)
+        return fixed
+
+    def parse_source_datetime(self, date_text=None, date_gmt_text=None):
+        """
+        원문 게시 시각 파싱.
+        - date_gmt가 있으면 UTC 기준으로 파싱
+        - 없으면 date를 JST/KST(+09:00)로 처리
+        """
+        try:
+            if date_gmt_text:
+                dt = datetime.fromisoformat(date_gmt_text.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.astimezone(SOURCE_TZ)
+            if date_text:
+                dt = datetime.fromisoformat(date_text.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=SOURCE_TZ)
+                return dt.astimezone(SOURCE_TZ)
+        except Exception:
+            pass
+        return datetime.now(SOURCE_TZ)
+
+    def to_wordpress_dates(self, source_dt):
+        """WordPress 게시용 date/date_gmt 생성"""
+        local_dt = source_dt.astimezone(SOURCE_TZ)
+        gmt_dt = source_dt.astimezone(timezone.utc)
+        return (
+            local_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+            gmt_dt.strftime("%Y-%m-%dT%H:%M:%S"),
+        )
         
-        print(f"✅ 처리할 새 기사: {len(recent_articles)}개")
-        return recent_articles
+    def fetch_source_articles(self):
+        """원문 WordPress API에서 최신순 기사 수집 (미게시 우선)"""
+        print(f"📡 원문 API 확인 중: {PRONEWS_POSTS_API}")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; proDG-bot/1.0)"
+        }
+        collected = []
+        seen_links = set()
+
+        for page in range(1, SOURCE_SCAN_MAX_PAGES + 1):
+            try:
+                params = {
+                    "per_page": 100,
+                    "page": page,
+                    "orderby": "date",
+                    "order": "desc",
+                    "_fields": "date,date_gmt,link,title",
+                }
+                res = requests.get(
+                    PRONEWS_POSTS_API,
+                    params=params,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT
+                )
+
+                # 마지막 페이지 이후 요청 시 WordPress가 400을 반환하는 경우가 있음
+                if res.status_code == 400:
+                    print(f"   ℹ️ 페이지 {page} 이후 기사 없음")
+                    break
+
+                res.raise_for_status()
+                posts = res.json()
+                if not posts:
+                    break
+
+                print(f"   🔎 페이지 {page}: {len(posts)}개 확인")
+                for post in posts:
+                    link = self.normalize_source_url(post.get("link", ""))
+                    if not link or link in seen_links:
+                        continue
+                    seen_links.add(link)
+
+                    if not FORCE_UPDATE and link in self.posted_articles:
+                        continue
+
+                    title_html = post.get("title", {}).get("rendered", "")
+                    title_text = BeautifulSoup(title_html, "lxml").get_text(" ", strip=True)
+                    article_date = self.parse_source_datetime(
+                        post.get("date"),
+                        post.get("date_gmt")
+                    )
+
+                    collected.append({
+                        "title": title_text or "제목 없음",
+                        "link": link,
+                        "date": article_date,
+                    })
+
+                    if len(collected) >= DAILY_POST_LIMIT:
+                        break
+
+                if len(collected) >= DAILY_POST_LIMIT:
+                    break
+
+            except Exception as e:
+                print(f"⚠️ 원문 목록 수집 실패 (page={page}): {e}")
+                break
+
+        # 최신 기사부터 게시되도록 날짜 내림차순 보장
+        collected.sort(key=lambda x: x["date"], reverse=True)
+        print(f"✅ 처리할 기사: {len(collected)}개 (일일 한도: {DAILY_POST_LIMIT})")
+        return collected[:DAILY_POST_LIMIT]
         
     def fetch_full_content(self, url):
         """
@@ -262,13 +372,16 @@ class NewsTranslator:
             print(f"⚠️ 이미지 검색 실패: {e}")
         return None
 
-    def post_to_wordpress(self, title, content, featured_media_id):
+    def post_to_wordpress(self, title, content, featured_media_id, article_date):
         """워드프레스 포스트 생성"""
+        post_date, post_date_gmt = self.to_wordpress_dates(article_date)
         post_data = {
             'title': title,
             'content': content,
             'status': 'publish',
-            'featured_media': featured_media_id if featured_media_id else 0
+            'featured_media': featured_media_id if featured_media_id else 0,
+            'date': post_date,
+            'date_gmt': post_date_gmt
         }
         
         try:
@@ -291,7 +404,9 @@ class NewsTranslator:
     def process_article(self, article):
         """기사 하나 처리: 스크래핑 → 번역 → 이미지 → 게시"""
         print(f"\n{'='*70}")
+        source_date = article["date"].astimezone(SOURCE_TZ)
         print(f"📰 처리 시작: {article['title']}")
+        print(f"🕒 원문 게시시각: {source_date.strftime('%Y-%m-%d %H:%M:%S %z')}")
         print(f"{'='*70}")
         
         # 1. 본문 전체 가져오기
@@ -333,28 +448,35 @@ class NewsTranslator:
 
         # 4. 본문 구성 (이미지 삽입 + 원본 링크)
         final_content = ""
+        normalized_source_link = self.normalize_source_url(article["link"])
         
         # 이미지가 있으면 본문 최상단에 삽입
         if uploaded_img_url:
             final_content += f'<figure style="margin: 0 0 30px 0;">'
             final_content += f'<img src="{uploaded_img_url}" alt="{title_ko}" style="width:100%; height:auto; display:block;" />'
             final_content += f'</figure>\n\n'
-        
-        # 본문 내용 (줄바꿈 HTML 처리)
-        final_content += content_ko.replace("\n", "<br>\n")
-        
+
+        # 본문 메타 + 본문 내용
+        final_content += "<div class='pronews-kr-article' style='font-family: \"Noto Sans KR\", sans-serif; line-height:1.85; font-size:17px;'>"
+        final_content += "<div style='border-top:2px solid #111; border-bottom:1px solid #ddd; padding:10px 0; margin:0 0 24px 0;'>"
+        final_content += f"<p style='margin:0; color:#555; font-size:13px;'>원문 게시시각: {source_date.strftime('%Y-%m-%d %H:%M')} (JST)</p>"
+        final_content += f"<p style='margin:6px 0 0 0; color:#111; font-size:13px;'>출처: <a href='{normalized_source_link}' target='_blank' rel='noopener'>jp.pronews.com</a></p>"
+        final_content += "</div>"
+        final_content += self.normalize_pronews_domains_in_text(content_ko).replace("\n", "<br>\n")
+        final_content += "</div>"
+
         # 원문 링크 추가
         final_content += f"\n\n<hr style='margin: 40px 0 20px 0;'>\n"
         final_content += f"<p style='font-size: 14px; color: #666;'>"
         final_content += f"ℹ️ <strong>원문 기사 보기:</strong> "
-        final_content += f"<a href='{article['link']}' target='_blank' rel='noopener'>{article['title']}</a>"
+        final_content += f"<a href='{normalized_source_link}' target='_blank' rel='noopener'>{article['title']}</a>"
         final_content += f"</p>"
         
         # 5. 워드프레스에 게시
         print(f"📤 워드프레스 게시 중...")
-        if self.post_to_wordpress(title_ko, final_content, featured_id):
+        if self.post_to_wordpress(title_ko, final_content, featured_id, article["date"]):
             if not FORCE_UPDATE:
-                self.posted_articles.append(article['link'])
+                self.posted_articles.add(normalized_source_link)
                 self.save_posted_articles()
             return True
         return False
@@ -372,8 +494,8 @@ class NewsTranslator:
             print("   WP_USER와 WP_APP_PASSWORD를 GitHub Secrets에 추가하세요.")
             sys.exit(1)
 
-        # RSS 피드에서 기사 가져오기
-        articles = self.fetch_rss_feed()
+        # 원문 WordPress API에서 기사 가져오기
+        articles = self.fetch_source_articles()
         
         if not articles:
             print("ℹ️  새로운 기사가 없습니다.")
@@ -381,7 +503,7 @@ class NewsTranslator:
         
         # 각 기사 처리
         success_count = 0
-        for article in articles[:10]:  # 하루 최대 10개
+        for article in articles:
             if self.process_article(article):
                 success_count += 1
             time.sleep(3)  # 서버 부하 방지
