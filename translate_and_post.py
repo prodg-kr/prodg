@@ -30,7 +30,6 @@ WORDPRESS_USER = os.environ.get("WP_USER")
 WORDPRESS_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD")
 PRONEWS_RSS = "https://jp.pronews.com/feed"
 POSTED_ARTICLES_FILE = "posted_articles.json"
-DAILY_LIMIT = 10
 FORCE_UPDATE = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
 
 class NewsTranslator:
@@ -54,7 +53,7 @@ class NewsTranslator:
         
     def fetch_rss_feed(self):
         """
-        [개선 1] 최신 기사부터 10건씩 처리
+        [개선 1] 최신 기사부터 모두 처리 (제한 없음)
         """
         print(f"📡 RSS 피드 확인 중: {PRONEWS_RSS}")
         feed = feedparser.parse(PRONEWS_RSS)
@@ -80,8 +79,8 @@ class NewsTranslator:
         # [개선 1] 최신순 정렬 (역순)
         all_articles.sort(key=lambda x: x['date'], reverse=True)
         
-        print(f"✅ 처리할 최신 기사: {len(all_articles)}개 (최대 {DAILY_LIMIT}개)")
-        return all_articles[:DAILY_LIMIT]
+        print(f"✅ 처리할 최신 기사: {len(all_articles)}개 (제한 없음)")
+        return all_articles  # 모든 기사 반환
         
     def fetch_full_content(self, url):
         """
