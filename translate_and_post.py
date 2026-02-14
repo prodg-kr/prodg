@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-pronews.jp 자동 번역 및 워드프레스 게시 시스템
-- 소스: jp.pronews.com WordPress API
-- 번역: Google Translate (일본어 → 한국어)
-- 게시: prodg.kr WordPress
-- 기능: 전체 본문 스크래핑, 이미지 본문 삽입
+pronews.jp 자동 번역 시스템 v3 (최종)
+개선사항:
+1. 최신 기사부터 10건씩 번역 (오래된 기사는 나중에)
+2. 원문 게시시각, 출처 텍스트 제거
+3. 영문 slug + 불필요 콘텐츠 제거
 """
 
 import os
 import sys
 import requests
-from datetime import datetime, timedelta, timezone
+import feedparser
+from datetime import datetime, timedelta
 from pathlib import Path
 import json
 import time
@@ -18,275 +19,83 @@ from urllib.parse import urlparse, urljoin
 from googletrans import Translator
 import html2text
 from bs4 import BeautifulSoup
+import hashlib
 import re
 
 # ==========================================
-# 설정 (Settings)
+# 설정
 # ==========================================
 WORDPRESS_URL = "https://prodg.kr"
 WORDPRESS_USER = os.environ.get("WP_USER")
 WORDPRESS_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD")
-PRONEWS_POSTS_API = "https://jp.pronews.com/wp-json/wp/v2/posts"
+PRONEWS_RSS = "https://jp.pronews.com/feed"
 POSTED_ARTICLES_FILE = "posted_articles.json"
-SOURCE_TZ = timezone(timedelta(hours=9))
-DAILY_POST_LIMIT = max(1, int(os.environ.get("DAILY_POST_LIMIT", "10")))
-SOURCE_SCAN_MAX_PAGES = max(1, int(os.environ.get("SOURCE_SCAN_MAX_PAGES", "60")))
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "20"))
-DESTINATION_SCAN_MAX_PAGES = max(1, int(os.environ.get("DESTINATION_SCAN_MAX_PAGES", "80")))
-
-# 중복 게시 방지 (False로 설정하면 이미 올린 글은 건너뜀)
-FORCE_UPDATE = False
-IMAGE_MODE = os.environ.get("IMAGE_MODE", "featured_only").strip().lower()
-VALID_IMAGE_MODES = {"featured_only", "body_only", "both", "none"}
-UPDATE_EXISTING = os.environ.get("UPDATE_EXISTING", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+DAILY_LIMIT = 10
+FORCE_UPDATE = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
 
 class NewsTranslator:
     def __init__(self):
         self.translator = Translator()
         self.wordpress_api = f"{WORDPRESS_URL}/wp-json/wp/v2"
         self.posted_articles = self.load_posted_articles()
-        self.destination_post_map = {}
-        self.destination_map_loaded = False
-        if IMAGE_MODE not in VALID_IMAGE_MODES:
-            print(f"⚠️ IMAGE_MODE='{IMAGE_MODE}'는 지원되지 않아 featured_only로 처리합니다.")
-            self.image_mode = "featured_only"
-        else:
-            self.image_mode = IMAGE_MODE
-        self.update_existing = UPDATE_EXISTING
         
     def load_posted_articles(self):
-        """이미 게시된 기사 목록 로드"""
         if Path(POSTED_ARTICLES_FILE).exists():
             with open(POSTED_ARTICLES_FILE, 'r') as f:
                 try:
-                    data = json.load(f)
-                    if isinstance(data, list):
-                        return set(data)
-                    if isinstance(data, dict):
-                        return set(data.keys())
-                    return set()
-                except Exception:
-                    return set()
-        return set()
+                    return json.load(f)
+                except:
+                    return []
+        return []
         
     def save_posted_articles(self):
-        """게시된 기사 목록 저장"""
         with open(POSTED_ARTICLES_FILE, 'w') as f:
-            json.dump(sorted(self.posted_articles), f, indent=2, ensure_ascii=False)
-
-    def normalize_source_url(self, raw_url):
-        """원문 도메인을 jp.pronews.com으로 정규화"""
-        if not raw_url:
-            return ""
-
-        normalized = raw_url.strip()
-        if not normalized.startswith(("http://", "https://")):
-            normalized = f"https://{normalized.lstrip('/')}"
-
-        parsed = urlparse(normalized)
-        netloc = parsed.netloc.lower()
-        if netloc.startswith("www."):
-            netloc = netloc[4:]
-
-        if netloc in {"pronews.jp", "www.pronews.jp", "ko.pronews.com"}:
-            netloc = "jp.pronews.com"
-
-        rebuilt = parsed._replace(netloc=netloc).geturl()
-        return rebuilt
-
-    def normalize_pronews_domains_in_text(self, text):
-        """번역 중 잘못 바뀐 pronews 도메인 복구"""
-        if not text:
-            return text
-
-        fixed = text
-        fixed = re.sub(r"https?://ko\.pronews\.com", "https://jp.pronews.com", fixed)
-        fixed = re.sub(r"https?://(?:www\.)?pronews\.jp", "https://jp.pronews.com", fixed)
-        return fixed
-
-    def parse_source_datetime(self, date_text=None, date_gmt_text=None):
-        """
-        원문 게시 시각 파싱.
-        - date_gmt가 있으면 UTC 기준으로 파싱
-        - 없으면 date를 JST/KST(+09:00)로 처리
-        """
-        try:
-            if date_gmt_text:
-                dt = datetime.fromisoformat(date_gmt_text.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(SOURCE_TZ)
-            if date_text:
-                dt = datetime.fromisoformat(date_text.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=SOURCE_TZ)
-                return dt.astimezone(SOURCE_TZ)
-        except Exception:
-            pass
-        return datetime.now(SOURCE_TZ)
-
-    def to_wordpress_dates(self, source_dt):
-        """WordPress 게시용 date/date_gmt 생성"""
-        local_dt = source_dt.astimezone(SOURCE_TZ)
-        gmt_dt = source_dt.astimezone(timezone.utc)
-        return (
-            local_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            gmt_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        )
-
-    def extract_source_link_from_post_content(self, rendered_html):
-        """대상 사이트 게시글 본문에서 원문 링크 추출"""
-        if not rendered_html:
-            return ""
-        try:
-            soup = BeautifulSoup(rendered_html, 'lxml')
-            for anchor in soup.find_all('a', href=True):
-                href = self.normalize_source_url(anchor['href'])
-                domain = urlparse(href).netloc.lower()
-                if domain == 'jp.pronews.com':
-                    return href
-        except Exception:
-            return ""
-        return ""
-
-    def load_destination_post_map(self):
-        """proDG 기존 게시글에서 원문 링크→게시글 ID 맵 구성"""
-        if self.destination_map_loaded:
-            return
-
-        print("🔎 기존 게시글 인덱스 로딩 중...")
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; proDG-bot/1.0)"}
-
-        for page in range(1, DESTINATION_SCAN_MAX_PAGES + 1):
-            try:
-                params = {
-                    "per_page": 100,
-                    "page": page,
-                    "orderby": "date",
-                    "order": "desc",
-                    "_fields": "id,content",
-                }
-                res = requests.get(
-                    f"{self.wordpress_api}/posts",
-                    params=params,
-                    auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT
-                )
-                if res.status_code == 400:
-                    break
-                res.raise_for_status()
-                posts = res.json()
-                if not posts:
-                    break
-
-                for post in posts:
-                    source_link = self.extract_source_link_from_post_content(
-                        post.get("content", {}).get("rendered", "")
-                    )
-                    if source_link and source_link not in self.destination_post_map:
-                        self.destination_post_map[source_link] = post.get("id")
-            except Exception as e:
-                print(f"⚠️ 기존 게시글 인덱스 로딩 실패 (page={page}): {e}")
-                break
-
-        self.destination_map_loaded = True
-        print(f"   ✅ 인덱싱 완료: {len(self.destination_post_map)}개 원문 링크")
-
-    def find_existing_post_id(self, source_link):
-        """원문 링크 기반으로 기존 게시글 ID 조회"""
-        self.load_destination_post_map()
-        return self.destination_post_map.get(source_link)
+            json.dump(self.posted_articles, f, indent=2)
         
-    def fetch_source_articles(self):
-        """원문 WordPress API에서 최신순 기사 수집 (미게시 우선)"""
-        print(f"📡 원문 API 확인 중: {PRONEWS_POSTS_API}")
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; proDG-bot/1.0)"
-        }
-        collected = []
-        seen_links = set()
+    def fetch_rss_feed(self):
+        """
+        [개선 1] 최신 기사부터 10건씩 처리
+        """
+        print(f"📡 RSS 피드 확인 중: {PRONEWS_RSS}")
+        feed = feedparser.parse(PRONEWS_RSS)
+        
+        all_articles = []
+        print(f"🔍 총 {len(feed.entries)}개의 피드 항목 검색...")
 
-        for page in range(1, SOURCE_SCAN_MAX_PAGES + 1):
+        for entry in feed.entries:
+            if not FORCE_UPDATE and entry.link in self.posted_articles:
+                continue
+                
             try:
-                params = {
-                    "per_page": 100,
-                    "page": page,
-                    "orderby": "date",
-                    "order": "desc",
-                    "_fields": "date,date_gmt,link,title",
-                }
-                res = requests.get(
-                    PRONEWS_POSTS_API,
-                    params=params,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT
-                )
-
-                # 마지막 페이지 이후 요청 시 WordPress가 400을 반환하는 경우가 있음
-                if res.status_code == 400:
-                    print(f"   ℹ️ 페이지 {page} 이후 기사 없음")
-                    break
-
-                res.raise_for_status()
-                posts = res.json()
-                if not posts:
-                    break
-
-                print(f"   🔎 페이지 {page}: {len(posts)}개 확인")
-                for post in posts:
-                    link = self.normalize_source_url(post.get("link", ""))
-                    if not link or link in seen_links:
-                        continue
-                    seen_links.add(link)
-
-                    if not FORCE_UPDATE and not self.update_existing and link in self.posted_articles:
-                        continue
-
-                    title_html = post.get("title", {}).get("rendered", "")
-                    title_text = BeautifulSoup(title_html, "lxml").get_text(" ", strip=True)
-                    article_date = self.parse_source_datetime(
-                        post.get("date"),
-                        post.get("date_gmt")
-                    )
-
-                    collected.append({
-                        "title": title_text or "제목 없음",
-                        "link": link,
-                        "date": article_date,
-                    })
-
-                    if len(collected) >= DAILY_POST_LIMIT:
-                        break
-
-                if len(collected) >= DAILY_POST_LIMIT:
-                    break
-
-            except Exception as e:
-                print(f"⚠️ 원문 목록 수집 실패 (page={page}): {e}")
-                break
-
-        # 최신 기사부터 게시되도록 날짜 내림차순 보장
-        collected.sort(key=lambda x: x["date"], reverse=True)
-        print(f"✅ 처리할 기사: {len(collected)}개 (일일 한도: {DAILY_POST_LIMIT})")
-        return collected[:DAILY_POST_LIMIT]
+                article_date = datetime(*entry.published_parsed[:6])
+            except:
+                article_date = datetime.now()
+                
+            all_articles.append({
+                'title': entry.title,
+                'link': entry.link,
+                'date': article_date
+            })
+        
+        # [개선 1] 최신순 정렬 (역순)
+        all_articles.sort(key=lambda x: x['date'], reverse=True)
+        
+        print(f"✅ 처리할 최신 기사: {len(all_articles)}개 (최대 {DAILY_LIMIT}개)")
+        return all_articles[:DAILY_LIMIT]
         
     def fetch_full_content(self, url):
         """
-        BeautifulSoup을 사용하여 실제 기사 본문 전체 스크래핑
+        [개선 2] 본문 스크래핑 + 불필요한 요소 제거
         """
         try:
-            print(f"📄 기사 원문 스크래핑 중: {url}")
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            print(f"📄 스크래핑: {url}")
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
             
             soup = BeautifulSoup(response.text, 'lxml')
             
             # pronews.com의 본문 영역 찾기
-            # 일반적인 워드프레스 구조: entry-content, post-content, article-content 등
             content_div = soup.find('div', class_='entry-content')
             if not content_div:
                 content_div = soup.find('div', class_='post-content')
@@ -296,104 +105,173 @@ class NewsTranslator:
                 content_div = soup.find('article')
                 
             if not content_div:
-                print("⚠️ 본문 영역을 찾지 못했습니다.")
                 return None
 
-            # 불필요한 태그 제거 (스크립트, 스타일, 광고 등)
-            for tag in content_div(['script', 'style', 'iframe', 'noscript', 'form', 'nav']):
+            # [개선 2] "원문 게시시각", "출처" 텍스트 제거
+            for elem in content_div.find_all(string=re.compile(r'원문 게시시각:|출처:|原文掲載時刻:|ソース:')):
+                parent = elem.find_parent()
+                if parent:
+                    # 해당 문단 전체 제거
+                    parent.decompose()
+
+            # 불필요한 태그 완전 제거
+            for tag in content_div(['script', 'style', 'iframe', 'noscript', 'form', 
+                                   'nav', 'aside', 'footer', 'header']):
                 tag.decompose()
             
-            # 광고 클래스 제거
-            for ad_class in ['ad', 'advertisement', 'banner', 'sidebar']:
-                for elem in content_div.find_all(class_=lambda x: x and ad_class in x.lower()):
+            # 소셜 공유 버튼 제거 (클래스명 기반)
+            for social_class in ['social-share', 'share-buttons', 'sns-share', 'social-links', 
+                                'share-links', 'addtoany', 'sharedaddy', 'jp-relatedposts',
+                                'entry-footer', 'post-tags', 'post-categories', 'post-meta']:
+                for elem in content_div.find_all(class_=lambda x: x and any(sc in str(x).lower() for sc in [social_class])):
                     elem.decompose()
+            
+            # 특정 텍스트 포함 요소 제거
+            remove_keywords = [
+                'FOLLOW US', '관련 기사', 'Related', 'Share this', 'Tweet',
+                '뉴스 일람', '칼럼 타이틀', '특집 타이틀', '라이터 목록',
+                'facebook.com', 'twitter.com', 'line.me', 'instagram.com',
+                'youtube.com', 'pronews.jp', 'kr.pronews.com', '/fellowship/',
+                'getpocket.com', 'hatena.ne.jp', '/feed', '/news/', '/columntitle/',
+                '/specialtitle/', '/writer/', 'jp.pronews.com'
+            ]
+            
+            # a 태그 제거 (본문 외부 링크)
+            for a in list(content_div.find_all('a')):
+                href = a.get('href', '')
+                text = a.get_text(strip=True)
                 
-            # HTML 문자열 반환
+                # 제거 조건
+                should_remove = any([
+                    any(kw in href.lower() for kw in remove_keywords),
+                    any(kw in text for kw in ['FOLLOW', 'Share', 'Tweet', 'More', 'Read more']),
+                    href.startswith('//www.facebook.com'),
+                    href.startswith('//twitter.com'),
+                    href.startswith('//line.me'),
+                    href.startswith('//'),  # 프로토콜 없는 외부 링크
+                    not text  # 빈 링크
+                ])
+                
+                if should_remove:
+                    a.decompose()
+            
+            # 빈 태그 제거
+            for tag_name in ['p', 'div', 'span', 'li', 'ul', 'ol']:
+                for tag in content_div.find_all(tag_name):
+                    if not tag.get_text(strip=True) and not tag.find('img'):
+                        tag.decompose()
+            
+            # 연속된 br 태그 정리
+            for br in content_div.find_all('br'):
+                next_sibling = br.find_next_sibling()
+                if next_sibling and next_sibling.name == 'br':
+                    br.decompose()
+                    
             return str(content_div)
             
         except Exception as e:
-            print(f"⚠️ 본문 가져오기 실패: {e}")
+            print(f"⚠️ 실패: {e}")
             return None
 
+    def generate_english_slug(self, title):
+        """영문 slug 생성"""
+        # 간단한 키워드 추출 (첫 3-5단어)
+        words = title.split()[:5]
+        
+        # 영문, 숫자만 추출
+        slug_words = []
+        for word in words:
+            # 영문자, 숫자, 하이픈만 남김
+            cleaned = re.sub(r'[^a-zA-Z0-9\-]', '', word.lower())
+            if cleaned and len(cleaned) > 2:
+                slug_words.append(cleaned)
+        
+        # slug 생성
+        if slug_words:
+            slug = '-'.join(slug_words[:4])  # 최대 4단어
+        else:
+            # 영문이 없으면 타임스탬프 기반
+            slug = f"article-{int(time.time())}"
+        
+        # 길이 제한 (50자)
+        return slug[:50]
+
     def translate_text(self, text):
-        """번역 함수 (긴 텍스트 자동 분할 처리)"""
+        """
+        [개선 2] 번역 + "원문 게시시각", "출처" 제거
+        """
         if not text: 
             return ""
         
         try:
-            # HTML을 텍스트로 변환
             h = html2text.HTML2Text()
             h.ignore_links = False
-            h.ignore_images = True  # 이미지는 별도 처리
-            h.body_width = 0  # 줄바꿈 방지
+            h.ignore_images = True
+            h.body_width = 0
             plain_text = h.handle(text)
             
-            # 너무 길면 청크로 나눠서 번역 (Google API 제한 대비)
-            max_chunk_size = 4000
-            if len(plain_text) > max_chunk_size:
-                print(f"   📏 긴 텍스트 감지 ({len(plain_text)}자) - 분할 번역 시작")
-                chunks = [plain_text[i:i+max_chunk_size] for i in range(0, len(plain_text), max_chunk_size)]
+            # [개선 2] "원문 게시시각:", "출처:" 텍스트 제거
+            plain_text = re.sub(r'원문 게시시각:.*?\n', '', plain_text)
+            plain_text = re.sub(r'出典:.*?\n', '', plain_text)
+            plain_text = re.sub(r'ソース:.*?\n', '', plain_text)
+            plain_text = re.sub(r'原文掲載時刻:.*?\n', '', plain_text)
+            
+            if len(plain_text) > 4000:
+                chunks = [plain_text[i:i+4000] for i in range(0, len(plain_text), 4000)]
                 translated_parts = []
-                
-                for i, chunk in enumerate(chunks, 1):
-                    print(f"   🔄 청크 {i}/{len(chunks)} 번역 중...")
+                for chunk in chunks:
                     res = self.translator.translate(chunk, src='ja', dest='ko')
                     translated_parts.append(res.text)
-                    time.sleep(1.5)  # API 제한 방지
-                    
+                    time.sleep(1)
                 return "\n\n".join(translated_parts)
             else:
                 result = self.translator.translate(plain_text, src='ja', dest='ko')
-                time.sleep(0.8)
+                time.sleep(0.5)
                 return result.text
-                
         except Exception as e:
-            print(f"⚠️ 번역 중 오류 발생: {e}")
-            return text  # 실패 시 원문 반환
+            print(f"⚠️ 번역 오류: {e}")
+            return text
 
     def download_image(self, url):
-        """이미지 다운로드"""
         if not url: 
             return None
         try:
-            print(f"🖼️  이미지 다운로드: {url}")
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            print(f"🖼️ 다운로드: {url}")
+            headers = {'User-Agent': 'Mozilla/5.0'}
             res = requests.get(url, headers=headers, timeout=15)
             res.raise_for_status()
             
-            # 파일명 처리
-            filename = os.path.basename(urlparse(url).path)
-            if not filename or len(filename) > 100:
-                filename = f"image_{int(time.time())}.jpg"
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+            timestamp = int(time.time())
             
-            # 쿼리 파라미터 제거
-            if '?' in filename:
-                filename = filename.split('?')[0]
-                
+            original_filename = os.path.basename(urlparse(url).path)
+            if '?' in original_filename:
+                original_filename = original_filename.split('?')[0]
+            
+            ext = os.path.splitext(original_filename)[1]
+            if not ext or ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                ext = '.jpg'
+            
+            filename = f"pronews_{timestamp}_{url_hash}{ext}"
             path = Path(f"/tmp/{filename}")
+            
             with open(path, 'wb') as f:
                 f.write(res.content)
             
-            print(f"   ✅ 저장 완료: {path.name}")
+            print(f"   ✅ {filename}")
             return path
-            
         except Exception as e:
-            print(f"⚠️ 이미지 다운로드 에러: {e}")
+            print(f"⚠️ 실패: {e}")
         return None
 
     def upload_media(self, image_path):
-        """워드프레스 미디어 업로드"""
         if not image_path or not image_path.exists(): 
             return None
         try:
             url = f"{self.wordpress_api}/media"
-            headers = {
-                'Content-Disposition': f'attachment; filename={image_path.name}'
-            }
             with open(image_path, 'rb') as img:
                 files = {'file': (image_path.name, img, 'image/jpeg')}
+                headers = {'Content-Disposition': f'attachment; filename={image_path.name}'}
                 res = requests.post(
                     url,
                     auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
@@ -401,63 +279,40 @@ class NewsTranslator:
                     files=files
                 )
                 res.raise_for_status()
-                media_data = res.json()
-                print(f"   ✅ 업로드 완료: ID {media_data['id']}")
-                return media_data  # {id, source_url, ...}
-                
+                return res.json()
         except Exception as e:
-            print(f"⚠️ 이미지 업로드 실패: {e}")
-            if hasattr(e, 'response'):
-                print(f"   상세: {e.response.text[:200]}")
+            print(f"⚠️ 업로드 실패: {e}")
         return None
 
     def get_main_image_url(self, link):
-        """Open Graph 등을 통해 대표 이미지 URL 추출"""
         try:
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            res = requests.get(link, headers=headers, timeout=10)
+            res = requests.get(link, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
             soup = BeautifulSoup(res.text, 'lxml')
             
-            # 1. Open Graph 이미지
             og_img = soup.find('meta', property='og:image')
             if og_img and og_img.get('content'):
-                img_url = og_img['content']
-                print(f"   📸 OG 이미지 발견")
-                return img_url
+                return og_img['content']
             
-            # 2. Twitter Card 이미지
-            tw_img = soup.find('meta', attrs={'name': 'twitter:image'})
-            if tw_img and tw_img.get('content'):
-                img_url = tw_img['content']
-                print(f"   📸 Twitter Card 이미지 발견")
-                return img_url
-            
-            # 3. 본문 첫 이미지
             content = soup.find('div', class_='entry-content')
             if content:
                 img = content.find('img')
                 if img and img.get('src'):
                     img_url = img['src']
-                    # 상대 경로를 절대 경로로
                     if not img_url.startswith('http'):
                         img_url = urljoin(link, img_url)
-                    print(f"   📸 본문 이미지 발견")
                     return img_url
-            
-        except Exception as e:
-            print(f"⚠️ 이미지 검색 실패: {e}")
+        except:
+            pass
         return None
 
-    def post_to_wordpress(self, title, content, featured_media_id, article_date):
-        """워드프레스 포스트 생성"""
-        post_date, post_date_gmt = self.to_wordpress_dates(article_date)
+    def post_to_wordpress(self, title, content, slug, featured_media_id, original_date):
         post_data = {
             'title': title,
             'content': content,
+            'slug': slug,
             'status': 'publish',
             'featured_media': featured_media_id if featured_media_id else 0,
-            'date': post_date,
-            'date_gmt': post_date_gmt
+            'date': original_date.strftime('%Y-%m-%dT%H:%M:%S')
         }
         
         try:
@@ -468,71 +323,38 @@ class NewsTranslator:
             )
             res.raise_for_status()
             post_info = res.json()
-            print(f"✨ 게시 성공! 링크: {post_info['link']}")
-            return True
-            
-        except Exception as e:
-            print(f"❌ 게시 실패: {e}")
-            if hasattr(e, 'response'):
-                print(f"   상세: {e.response.text[:300]}")
-            return False
-
-    def update_post_to_wordpress(self, post_id, title, content, featured_media_id, article_date):
-        """기존 워드프레스 포스트 업데이트"""
-        post_date, post_date_gmt = self.to_wordpress_dates(article_date)
-        post_data = {
-            'title': title,
-            'content': content,
-            'status': 'publish',
-            'featured_media': featured_media_id if featured_media_id else 0,
-            'date': post_date,
-            'date_gmt': post_date_gmt
-        }
-
-        try:
-            res = requests.post(
-                f"{self.wordpress_api}/posts/{post_id}",
-                auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
-                json=post_data
-            )
-            res.raise_for_status()
-            post_info = res.json()
-            print(f"♻️ 업데이트 성공! 링크: {post_info['link']}")
+            print(f"✨ 게시 성공! {post_info['link']}")
             return True
         except Exception as e:
-            print(f"❌ 업데이트 실패: {e}")
+            print(f"❌ 실패: {e}")
             if hasattr(e, 'response'):
-                print(f"   상세: {e.response.text[:300]}")
+                print(f"   {e.response.text[:200]}")
             return False
 
     def process_article(self, article):
-        """기사 하나 처리: 스크래핑 → 번역 → 이미지 → 게시"""
-        print(f"\n{'='*70}")
-        source_date = article["date"].astimezone(SOURCE_TZ)
-        print(f"📰 처리 시작: {article['title']}")
-        print(f"🕒 원문 게시시각: {source_date.strftime('%Y-%m-%d %H:%M:%S %z')}")
-        print(f"{'='*70}")
+        print(f"\n{'='*60}")
+        print(f"📰 {article['title'][:50]}...")
+        print(f"📅 {article['date'].strftime('%Y-%m-%d %H:%M')}")
+        print(f"{'='*60}")
         
-        # 1. 본문 전체 가져오기
+        # 본문 스크래핑
         raw_html = self.fetch_full_content(article['link'])
         if not raw_html:
-            print("   ⚠️  본문을 가져오지 못해 건너뜁니다.")
             return False
             
-        # 2. 번역 (제목 및 본문)
-        print(f"🔄 제목 번역 중...")
+        # 번역
+        print(f"🔄 번역 중...")
         title_ko = self.translate_text(article['title'])
-        print(f"   ✅ \"{title_ko}\"")
-        
-        print(f"🔄 본문 번역 중...")
         content_ko = self.translate_text(raw_html)
-        print(f"   ✅ 본문 번역 완료 ({len(content_ko)}자)")
         
-        # 3. 이미지 처리
-        print(f"🔍 이미지 검색 중...")
+        # 영문 slug 생성
+        slug = self.generate_english_slug(article['title'])
+        print(f"🔗 Slug: {slug}")
+        
+        # 이미지 처리
+        print(f"🔍 이미지...")
         img_url = self.get_main_image_url(article['link'])
         featured_id = 0
-        uploaded_img_url = ""
         
         if img_url:
             local_img = self.download_image(img_url)
@@ -540,108 +362,54 @@ class NewsTranslator:
                 media_info = self.upload_media(local_img)
                 if media_info:
                     featured_id = media_info['id']
-                    uploaded_img_url = media_info['source_url']
-                    
-                # 임시 파일 삭제
                 try: 
                     local_img.unlink()
                 except: 
                     pass
-        else:
-            print("   ℹ️  이미지 없음")
 
-        # 4. 본문 구성
-        final_content = ""
-        normalized_source_link = self.normalize_source_url(article["link"])
-
-        use_featured_image = self.image_mode in {"featured_only", "both"}
-        use_body_image = self.image_mode in {"body_only", "both"}
-
-        # 본문 이미지 모드일 때만 상단 삽입
-        if uploaded_img_url and use_body_image:
-            final_content += f'<figure style="margin: 0 0 30px 0;">'
-            final_content += f'<img src="{uploaded_img_url}" alt="{title_ko}" style="width:100%; height:auto; display:block;" />'
-            final_content += f'</figure>\n\n'
-
-        # 본문 메타 + 본문 내용
-        final_content += "<div class='pronews-kr-article' style='font-family: \"Noto Sans KR\", sans-serif; line-height:1.85; font-size:17px;'>"
-        final_content += "<div style='border-top:2px solid #111; border-bottom:1px solid #ddd; padding:10px 0; margin:0 0 24px 0;'>"
-        final_content += f"<p style='margin:0; color:#555; font-size:13px;'>원문 게시시각: {source_date.strftime('%Y-%m-%d %H:%M')} (JST)</p>"
-        final_content += f"<p style='margin:6px 0 0 0; color:#111; font-size:13px;'>출처: <a href='{normalized_source_link}' target='_blank' rel='noopener'>jp.pronews.com</a></p>"
-        final_content += "</div>"
-        final_content += self.normalize_pronews_domains_in_text(content_ko).replace("\n", "<br>\n")
-        final_content += "</div>"
-
-        # 원문 링크 추가
-        final_content += f"\n\n<hr style='margin: 40px 0 20px 0;'>\n"
-        final_content += f"<p style='font-size: 14px; color: #666;'>"
-        final_content += f"ℹ️ <strong>원문 기사 보기:</strong> "
-        final_content += f"<a href='{normalized_source_link}' target='_blank' rel='noopener'>{article['title']}</a>"
+        # 본문 구성
+        final_content = content_ko.replace("\n", "<br>\n")
+        
+        # 원문 링크 (하단)
+        final_content += f"\n\n<hr style='margin:40px 0 20px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
+        final_content += f"<p style='font-size:13px;color:#777;'>"
+        final_content += f"<strong>원문:</strong> <a href='{article['link']}' target='_blank' rel='noopener'>{article['title']}</a>"
         final_content += f"</p>"
         
-        # 5. 워드프레스에 게시
-        existing_post_id = self.find_existing_post_id(normalized_source_link) if self.update_existing else None
-        final_featured_id = featured_id if use_featured_image else 0
-
-        if existing_post_id:
-            print(f"📤 기존 글 업데이트 중... (ID: {existing_post_id})")
-            action_ok = self.update_post_to_wordpress(
-                existing_post_id,
-                title_ko,
-                final_content,
-                final_featured_id,
-                article["date"]
-            )
-        else:
-            print(f"📤 워드프레스 신규 게시 중...")
-            action_ok = self.post_to_wordpress(
-                title_ko,
-                final_content,
-                final_featured_id,
-                article["date"]
-            )
-
-        if action_ok:
+        # 게시
+        print(f"📤 게시...")
+        if self.post_to_wordpress(title_ko, final_content, slug, featured_id, article['date']):
             if not FORCE_UPDATE:
-                self.posted_articles.add(normalized_source_link)
+                self.posted_articles.append(article['link'])
                 self.save_posted_articles()
-            if self.update_existing and existing_post_id:
-                self.destination_post_map[normalized_source_link] = existing_post_id
             return True
         return False
 
     def run(self):
-        """메인 실행 함수"""
-        print(f"\n{'🚀'*35}")
-        print(f"  pronews.jp 자동 번역 시스템 시작")
-        print(f"  실행 시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"  IMAGE_MODE: {self.image_mode}")
-        print(f"  UPDATE_EXISTING: {self.update_existing}")
-        print(f"{'🚀'*35}\n")
+        print(f"\n{'='*60}")
+        print(f"pronews.jp → prodg.kr 자동 번역 v3")
+        print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*60}\n")
         
-        # 환경 변수 확인
         if not WORDPRESS_USER or not WORDPRESS_APP_PASSWORD:
-            print("❌ 환경 변수 설정 필요!")
-            print("   WP_USER와 WP_APP_PASSWORD를 GitHub Secrets에 추가하세요.")
+            print("❌ 환경 변수 필요!")
             sys.exit(1)
 
-        # 원문 WordPress API에서 기사 가져오기
-        articles = self.fetch_source_articles()
+        articles = self.fetch_rss_feed()
         
         if not articles:
-            print("ℹ️  새로운 기사가 없습니다.")
+            print("✅ 처리할 기사 없음")
             return
         
-        # 각 기사 처리
-        success_count = 0
+        success = 0
         for article in articles:
             if self.process_article(article):
-                success_count += 1
-            time.sleep(3)  # 서버 부하 방지
+                success += 1
+            time.sleep(3)
             
-        print(f"\n{'='*70}")
-        print(f"🏁 작업 완료: {success_count}/{len(articles)}개 기사 게시됨")
-        print(f"{'='*70}\n")
+        print(f"\n{'='*60}")
+        print(f"🏁 완료: {success}/{len(articles)}개 최신 기사 게시")
+        print(f"{'='*60}\n")
 
 if __name__ == "__main__":
     bot = NewsTranslator()
