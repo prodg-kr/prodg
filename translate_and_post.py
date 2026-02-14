@@ -108,11 +108,25 @@ class NewsTranslator:
                 return None
 
             # [개선 2] "원문 게시시각", "출처" 텍스트 제거
-            for elem in content_div.find_all(string=re.compile(r'원문 게시시각:|출처:|原文掲載時刻:|ソース:')):
+            for elem in content_div.find_all(string=re.compile(r'원문 게시시각:|출처:|原文掲載時刻:|ソース:|バックナンバー|関連キーワード|この記事をシェア|FOLLOW US')):
                 parent = elem.find_parent()
                 if parent:
                     # 해당 문단 전체 제거
                     parent.decompose()
+            
+            # h3 제목이 "백 넘버", "관련 키워드", "이 기사 공유" 등인 섹션 제거
+            for h_tag in content_div.find_all(['h3', 'h2', 'h4']):
+                h_text = h_tag.get_text(strip=True)
+                if any(keyword in h_text for keyword in ['백 넘버', '関連キーワード', 'バックナンバー', 
+                                                          'この記事をシェア', '이 기사 공유', 'FOLLOW US',
+                                                          '関連記事', '관련 기사']):
+                    # h 태그 다음의 모든 형제 요소도 제거 (섹션 전체)
+                    next_elem = h_tag.find_next_sibling()
+                    h_tag.decompose()
+                    while next_elem and next_elem.name not in ['h1', 'h2', 'h3', 'h4']:
+                        temp = next_elem.find_next_sibling()
+                        next_elem.decompose()
+                        next_elem = temp
 
             # 불필요한 태그 완전 제거
             for tag in content_div(['script', 'style', 'iframe', 'noscript', 'form', 
@@ -199,16 +213,33 @@ class NewsTranslator:
     def translate_text(self, text):
         """
         [개선 2] 번역 + "원문 게시시각", "출처" 제거
+        [개선 4] HTML 헤더 태그 유지
         """
         if not text: 
             return ""
         
         try:
+            # BeautifulSoup으로 HTML 파싱
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(text, 'lxml')
+            
+            # h1~h6 태그를 임시로 저장
+            headers = {}
+            for i, tag in enumerate(soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])):
+                placeholder = f"___HEADER_{i}___"
+                headers[placeholder] = {
+                    'tag': tag.name,
+                    'class': tag.get('class', []),
+                    'text': tag.get_text(strip=True)
+                }
+                tag.replace_with(placeholder)
+            
+            # HTML을 텍스트로 변환
             h = html2text.HTML2Text()
             h.ignore_links = False
             h.ignore_images = True
             h.body_width = 0
-            plain_text = h.handle(text)
+            plain_text = h.handle(str(soup))
             
             # [개선 2] "원문 게시시각:", "출처:" 텍스트 제거
             plain_text = re.sub(r'원문 게시시각:.*?\n', '', plain_text)
@@ -216,6 +247,7 @@ class NewsTranslator:
             plain_text = re.sub(r'ソース:.*?\n', '', plain_text)
             plain_text = re.sub(r'原文掲載時刻:.*?\n', '', plain_text)
             
+            # 번역
             if len(plain_text) > 4000:
                 chunks = [plain_text[i:i+4000] for i in range(0, len(plain_text), 4000)]
                 translated_parts = []
@@ -223,11 +255,36 @@ class NewsTranslator:
                     res = self.translator.translate(chunk, src='ja', dest='ko')
                     translated_parts.append(res.text)
                     time.sleep(1)
-                return "\n\n".join(translated_parts)
+                translated_text = "\n\n".join(translated_parts)
             else:
                 result = self.translator.translate(plain_text, src='ja', dest='ko')
                 time.sleep(0.5)
-                return result.text
+                translated_text = result.text
+            
+            # 헤더 태그 복원
+            for placeholder, header_info in headers.items():
+                tag_name = header_info['tag']
+                classes = ' '.join(header_info['class']) if header_info['class'] else ''
+                
+                # 플레이스홀더를 찾아서 번역
+                if placeholder in translated_text:
+                    # 원본 텍스트도 번역
+                    try:
+                        translated_header = self.translator.translate(header_info['text'], src='ja', dest='ko').text
+                        time.sleep(0.3)
+                    except:
+                        translated_header = header_info['text']
+                    
+                    # HTML 태그로 복원
+                    if classes:
+                        replacement = f'<{tag_name} class="{classes}">{translated_header}</{tag_name}>'
+                    else:
+                        replacement = f'<{tag_name}>{translated_header}</{tag_name}>'
+                    
+                    translated_text = translated_text.replace(placeholder, replacement)
+            
+            return translated_text
+            
         except Exception as e:
             print(f"⚠️ 번역 오류: {e}")
             return text
