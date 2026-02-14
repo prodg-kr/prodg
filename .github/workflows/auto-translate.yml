@@ -2,8 +2,8 @@ name: pronews.jp 자동 번역 및 게시
 
 on:
   schedule:
-    # 매일 오전 7시 (한국 시간)
-    # UTC 22:00 = KST 07:00
+    # 매일 오전 7시 (한국 시간 기준)
+    # UTC 기준 22:00 = KST 07:00 (다음날)
     - cron: '0 22 * * *'
   
   # 수동 실행 가능
@@ -39,9 +39,6 @@ jobs:
       env:
         WP_USER: ${{ secrets.WP_USER }}
         WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-        DAILY_POST_LIMIT: "10"
-        SOURCE_SCAN_MAX_PAGES: "80"
-        REQUEST_TIMEOUT: "20"
       run: |
         python translate_and_post.py
     
@@ -56,3 +53,4 @@ jobs:
       if: always()
       run: |
         echo "✅ 작업 완료: $(date)"
+        echo "다음 실행: 내일 오전 7시"
