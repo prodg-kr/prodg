@@ -295,13 +295,16 @@ class GeminiEditor:
 편집 규칙:
 1. HTML 태그(<p>, <h2>, <h3>, <img> 등)는 반드시 그대로 유지
 2. 직역체, 어색한 조사, 일본식 표현을 자연스러운 한국어로 수정
-3. 영상/카메라 전문용어 정확히 표기:
+3. 문체는 반드시 '~합니다', '~했습니다', '~입니다' 등 합쇼체(격식체)로 통일
+   - '~한다', '~했다', '~이다' 등 평서체 사용 금지
+   - '~해요', '~예요' 등 해요체 사용 금지
+4. 영상/카메라 전문용어 정확히 표기:
    - 브랜드명: Sony, Canon, Nikon, DJI, Blackmagic, DaVinci Resolve 등 원문 유지
    - 해상도: 4K, 8K, Full HD
    - 프레임레이트: fps, 24p, 60p
    - 기타: 코덱, 비트레이트, 조리개, 셔터스피드 등 정확한 한국어 사용
-4. 단락 구조와 문장 수 유지 (내용 추가/삭제 금지)
-5. HTML만 출력 (설명 텍스트 없음)
+5. 단락 구조와 문장 수 유지 (내용 추가/삭제 금지)
+6. HTML만 출력 (설명 텍스트 없음)
 
 번역된 HTML:
 {html_chunk}"""
@@ -520,6 +523,57 @@ class NewsTranslator:
             print(f"⚠️ 미디어 업로드 실패: {e}")
             return None
 
+    def is_already_posted_on_wp(self, original_url: str) -> bool:
+        """
+        WordPress에서 원문 URL 기준으로 중복 게시 여부 확인
+        - posted_articles.json 캐시 실패 시 2차 안전망 역할
+        - 원문 링크를 본문에 포함하므로 검색으로 찾을 수 있음
+        """
+        try:
+            # 원문 URL의 일부로 WordPress 검색
+            search_term = original_url.split('/')[-2] if original_url.endswith('/') else original_url.split('/')[-1]
+            res = requests.get(
+                f"{self.wordpress_api}/posts",
+                auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
+                params={'search': search_term, 'per_page': 5, 'status': 'publish'},
+                timeout=10
+            )
+            if res.status_code == 200:
+                posts = res.json()
+                for post in posts:
+                    if original_url in post.get('content', {}).get('rendered', ''):
+                        print(f"⚠️ 중복 감지 → 스킵: {post['link']}")
+                        return True
+            return False
+        except Exception as e:
+            print(f"⚠️ 중복 체크 오류 (계속 진행): {e}")
+            return False  # 오류 시 게시 진행 (보수적 처리)
+
+    def commit_posted_articles(self):
+        """
+        posted_articles.json을 git 저장소에 커밋
+        - GitHub Actions 캐시 대신 git으로 영구 보존
+        - 캐시가 날아가도 중복 게시 방지
+        """
+        try:
+            import subprocess
+            subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
+            subprocess.run(['git', 'config', 'user.name', 'GitHub Action'], check=True)
+            subprocess.run(['git', 'add', POSTED_ARTICLES_FILE], check=True)
+            result = subprocess.run(
+                ['git', 'diff', '--cached', '--quiet'],
+                capture_output=True
+            )
+            if result.returncode != 0:  # 변경사항 있을 때만 커밋
+                subprocess.run(
+                    ['git', 'commit', '-m', f'chore: update posted_articles [{datetime.now().strftime("%Y-%m-%d %H:%M")}]'],
+                    check=True
+                )
+                subprocess.run(['git', 'push'], check=True)
+                print("📝 posted_articles.json → git 커밋 완료")
+        except Exception as e:
+            print(f"⚠️ git 커밋 실패 (캐시로 대체): {e}")
+
     def post_to_wordpress(self, title: str, content: str, slug: str,
                            featured_media_id: int, original_date: datetime) -> bool:
         post_data = {
@@ -551,28 +605,35 @@ class NewsTranslator:
         print(f"📅 {article['date'].strftime('%Y-%m-%d %H:%M')}")
         print(f"{'='*60}")
 
-        # 1. 본문 스크래핑
+        # 1. 중복 체크 (posted_articles.json + WordPress 2중 확인)
+        if not FORCE_UPDATE and self.is_already_posted_on_wp(article['link']):
+            if article['link'] not in self.posted_articles:
+                self.posted_articles.append(article['link'])
+                self.save_posted_articles()
+            return False
+
+        # 2. 본문 스크래핑
         raw_html = self.fetch_full_content(article['link'])
         if not raw_html:
             print("⚠️ 본문 스크래핑 실패 → 스킵")
             return False
 
-        # 2. Groq 1차 번역
+        # 3. Groq 1차 번역
         print("🔄 [1단계] Groq 번역 중...")
         title_ko_raw = self.groq.translate_title(article['title'])
         content_ko_raw = self.groq.translate_content(raw_html)
         print(f"   번역 제목: {title_ko_raw}")
 
-        # 3. Gemini 2차 SEO 편집
+        # 4. Gemini 2차 SEO 편집
         print("✏️  [2단계] Gemini SEO 편집 중...")
         title_ko = self.gemini.edit_title(title_ko_raw, article['title'])
         content_ko = self.gemini.edit_content(content_ko_raw)
 
-        # 4. Slug 생성
+        # 5. Slug 생성
         slug = self.generate_slug(article['title'], article['date'])
         print(f"🔗 Slug: {slug}")
 
-        # 5. 이미지 처리
+        # 6. 이미지 처리
         print("🔍 이미지 처리 중...")
         featured_id = 0
         img_url = self.get_main_image_url(article['link'])
@@ -587,7 +648,7 @@ class NewsTranslator:
                 except:
                     pass
 
-        # 6. 최종 본문 구성 + 원문 출처
+        # 7. 최종 본문 구성 + 원문 출처
         final_content = content_ko
         final_content += (
             "\n\n<hr style='margin:40px 0 20px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
@@ -597,7 +658,7 @@ class NewsTranslator:
             f"</p>"
         )
 
-        # 7. WordPress 게시
+        # 8. WordPress 게시
         print("📤 WordPress 게시 중...")
         if self.post_to_wordpress(title_ko, final_content, slug, featured_id, article['date']):
             if not FORCE_UPDATE:
@@ -634,6 +695,10 @@ class NewsTranslator:
         print(f"\n{'='*60}")
         print(f"🏁 완료: {success}/{len(articles)}건 게시")
         print(f"{'='*60}\n")
+
+        # 게시 기록 git 커밋 (캐시 유실 방지)
+        if success > 0:
+            self.commit_posted_articles()
 
 
 if __name__ == "__main__":
