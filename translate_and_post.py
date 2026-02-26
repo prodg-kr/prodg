@@ -176,9 +176,9 @@ class GeminiEngine:
     def translate_and_edit_content(self, html_content: str) -> str:
         """
         본문 번역 + SEO 편집 통합 (Gemini 단일 처리)
+        - HTML 구조 완전 보존 (img, iframe, video, strong, em, a 등)
         - 일본어 → 한국어 번역 (문맥 일관성 유지)
         - 직역체 → 자연스러운 합쇼체
-        - HTML 태그 구조 유지
         - 일본어 잔존 시 재번역
         """
         if not html_content:
@@ -186,96 +186,141 @@ class GeminiEngine:
 
         soup = BeautifulSoup(html_content, 'lxml')
 
-        # 이미지 태그 보존
-        images = {}
-        for i, img in enumerate(soup.find_all('img')):
-            placeholder = f"___IMG_{i}___"
-            images[placeholder] = str(img)
-            img.replace_with(placeholder)
-
-        # 헤더 태그 보존
-        headers_map = {}
-        for i, tag in enumerate(soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])):
-            placeholder = f"___H{i}_{tag.name}___"
-            headers_map[placeholder] = {'tag': tag.name, 'text': tag.get_text(strip=True)}
+        # 1. 미디어 태그를 플레이스홀더로 보호 (img, iframe, video, figure, source)
+        protected_media = {}
+        media_counter = 0
+        for tag in soup.find_all(['img', 'iframe', 'video', 'figure', 'source', 'picture']):
+            placeholder = f"___MEDIA_{media_counter}___"
+            protected_media[placeholder] = str(tag)
             tag.replace_with(placeholder)
+            media_counter += 1
+        if media_counter > 0:
+            print(f"   🖼️ 미디어 {media_counter}개 보호 (이미지/동영상)")
 
-        # 단락 단위 텍스트 추출
-        paragraphs = []
-        for elem in soup.find_all(['p', 'li', 'blockquote']):
-            text = elem.get_text(separator=' ', strip=True)
-            if text and len(text) > 5:
-                paragraphs.append(text)
+        # 2. 번역 대상 block 요소 수집 (innerHTML 보존)
+        block_tags = ['p', 'li', 'blockquote', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']
+        blocks = soup.find_all(block_tags)
 
-        if not paragraphs:
+        if not blocks:
+            # block 요소 없으면 전체 텍스트에서 추출
             full_text = soup.get_text(separator='\n', strip=True)
-            paragraphs = [line for line in full_text.split('\n') if line.strip()]
+            if not full_text:
+                return html_content
+            translated = self._translate_chunk(full_text)
+            if not translated:
+                return ""
+            result_html = f"<p>{translated}</p>"
+            for ph, original in protected_media.items():
+                result_html = result_html.replace(ph, original)
+            return result_html
 
-        if not paragraphs:
-            return html_content
+        # 3. block 요소의 innerHTML 추출 + 청크 묶기
+        translatable_blocks = []  # (block_element, inner_html)
+        for block in blocks:
+            inner_html = block.decode_contents().strip()
+            if not inner_html:
+                continue
+            # 미디어 플레이스홀더만 있는 블록은 번역 불필요
+            text_only = re.sub(r'___MEDIA_\d+___', '', inner_html)
+            text_only = re.sub(r'<[^>]+>', '', text_only).strip()
+            if not text_only or len(text_only) < 3:
+                continue
+            translatable_blocks.append((block, inner_html))
 
-        # 청크 단위 번역+편집 (Gemini 토큰 한도 고려, 청크당 3000자)
-        translated_paragraphs = []
-        chunk, chunk_size = [], 0
+        if not translatable_blocks:
+            # 번역할 텍스트 블록이 없으면 미디어만 복원 후 반환
+            result_html = str(soup)
+            for ph, original in protected_media.items():
+                result_html = result_html.replace(ph, original)
+            return result_html
 
-        for para in paragraphs:
-            if chunk_size + len(para) > 3000 and chunk:
-                result = self._translate_chunk('\n\n'.join(chunk))
-                translated_paragraphs.extend(result.split('\n\n'))
-                chunk, chunk_size = [], 0
-                time.sleep(1)
-            chunk.append(para)
-            chunk_size += len(para)
+        # 4. 청크 단위 번역 (Gemini 토큰 한도 고려, 청크당 3000자)
+        #    구분자로 블록을 묶어 보내고, 결과를 다시 분리
+        SEPARATOR = "\n<!--BLOCK_SEP-->\n"
+        chunks = []  # [(start_idx, end_idx, combined_html)]
+        current_chunk = []
+        current_size = 0
+        start_idx = 0
 
-        if chunk:
-            result = self._translate_chunk('\n\n'.join(chunk))
-            translated_paragraphs.extend(result.split('\n\n'))
+        for i, (block, inner_html) in enumerate(translatable_blocks):
+            if current_size + len(inner_html) > 3000 and current_chunk:
+                chunks.append((start_idx, i, SEPARATOR.join(current_chunk)))
+                current_chunk = []
+                current_size = 0
+                start_idx = i
+            current_chunk.append(inner_html)
+            current_size += len(inner_html)
 
-        # 번역 결과 검증: 대부분의 청크가 비어있으면 실패 처리
-        non_empty = [p for p in translated_paragraphs if p.strip()]
-        if len(non_empty) < len(paragraphs) * 0.3:
-            print(f"❌ 본문 번역 실패 — 번역된 단락 {len(non_empty)}/{len(paragraphs)}개")
+        if current_chunk:
+            chunks.append((start_idx, len(translatable_blocks), SEPARATOR.join(current_chunk)))
+
+        # 5. 청크별 번역 수행
+        translated_blocks = []
+        for chunk_start, chunk_end, chunk_html in chunks:
+            translated = self._translate_chunk(chunk_html)
+            if not translated:
+                print(f"   ⚠️ 청크 번역 실패 ({chunk_start}-{chunk_end})")
+                # 실패 시 원문 유지
+                for j in range(chunk_start, chunk_end):
+                    translated_blocks.append(translatable_blocks[j][1])
+                continue
+            # 번역 결과를 구분자로 분리
+            parts = translated.split('<!--BLOCK_SEP-->')
+            expected_count = chunk_end - chunk_start
+            if len(parts) == expected_count:
+                translated_blocks.extend([p.strip() for p in parts])
+            else:
+                # 구분자 개수가 맞지 않으면 균등 분배 시도
+                print(f"   ⚠️ 블록 수 불일치 (예상: {expected_count}, 실제: {len(parts)}) — 전체 적용")
+                if len(parts) >= expected_count:
+                    translated_blocks.extend([p.strip() for p in parts[:expected_count]])
+                else:
+                    # 부족하면 마지막 파트에 나머지 합치기
+                    for p in parts:
+                        translated_blocks.append(p.strip())
+                    for _ in range(expected_count - len(parts)):
+                        translated_blocks.append('')
+            time.sleep(1)
+
+        # 번역 결과 검증
+        non_empty = [b for b in translated_blocks if b.strip()]
+        total_blocks = len(translatable_blocks)
+        if len(non_empty) < total_blocks * 0.3:
+            print(f"❌ 본문 번역 실패 — 번역된 블록 {len(non_empty)}/{total_blocks}개")
             return ""
 
-        # HTML 재조립
-        translated_html = ""
-        for para in translated_paragraphs:
-            para = para.strip()
-            if not para:
-                continue
-            if para.startswith('___'):
-                translated_html += para + "\n"
-            else:
-                translated_html += f"<p>{para}</p>\n"
+        # 6. 번역된 내용을 원래 block 요소에 삽입 (HTML 구조 보존)
+        for i, (block, _) in enumerate(translatable_blocks):
+            if i < len(translated_blocks) and translated_blocks[i]:
+                block.clear()
+                new_content = BeautifulSoup(translated_blocks[i], 'html.parser')
+                for child in list(new_content.children):
+                    block.append(child)
 
-        # 헤더 태그 복원 (헤더 텍스트도 번역)
-        for placeholder, info in headers_map.items():
-            if placeholder in translated_html:
-                header_ko = self._translate_single(info['text']) if info['text'] else info['text']
-                translated_html = translated_html.replace(
-                    placeholder,
-                    f"<{info['tag']}>{header_ko}</{info['tag']}>"
-                )
+        # 7. 결과 HTML 생성
+        # body 태그 안의 내용만 추출 (lxml이 자동 추가하는 html/body 제거)
+        body = soup.find('body')
+        result_html = body.decode_contents() if body else str(soup)
 
-        # 이미지 태그 복원
-        for placeholder, img_tag in images.items():
-            translated_html = translated_html.replace(placeholder, img_tag)
+        # 8. 미디어 플레이스홀더 → 원본 태그 복원
+        for placeholder, original in protected_media.items():
+            result_html = result_html.replace(placeholder, original)
 
-        # 일본어 잔존 검사 → 잔존 시 재번역
-        if self._has_japanese(translated_html):
+        # 9. 일본어 잔존 검사 → 잔존 시 재번역
+        if self._has_japanese(result_html):
             print("   ⚠️ 일본어 잔존 감지 → 재번역 시도...")
-            translated_html = self._cleanup_japanese(translated_html)
+            result_html = self._cleanup_japanese(result_html)
 
-        return translated_html
+        return result_html
 
-    def _translate_chunk(self, text: str) -> str:
-        """텍스트 청크 번역 + SEO 편집 통합 프롬프트"""
-        if not text.strip():
-            return text
+    def _translate_chunk(self, html_text: str) -> str:
+        """HTML 포함 텍스트 청크 번역 + SEO 편집 통합 프롬프트"""
+        if not html_text.strip():
+            return html_text
 
         prompt = f"""당신은 영상/카메라 전문 미디어의 한국어 에디터입니다.
 
-아래 일본어 텍스트를 한국어로 번역하고 자연스럽게 편집하세요.
+아래 일본어 텍스트(HTML 포함)를 한국어로 번역하고 자연스럽게 편집하세요.
 
 번역+편집 규칙:
 1. 일본어를 완전히 한국어로 번역 (히라가나·가타카나·한자 단어 절대 남기지 말 것)
@@ -283,19 +328,22 @@ class GeminiEngine:
    ('~한다', '~했다', '~이다' 평서체 사용 금지)
 3. 직역체, 어색한 조사, 일본식 표현을 자연스러운 한국어로 수정
 4. 영상/카메라 전문용어 정확히 표기:
-   - 브랜드명: Sony, Canon, Nikon, DJI, Blackmagic, DaVinci Resolve 등 원문 유지
+   - 브랜드명: Sony, Canon, Nikon, DJI, Blackmagic, Sigma, DaVinci Resolve 등 원문 유지
    - 해상도: 4K, 8K, Full HD / 프레임레이트: fps, 24p, 60p
    - 기타: 코덱, 비트레이트, 조리개, 셔터스피드, 보케, 손떨림보정 등
-5. ___IMG_0___, ___H0_h2___ 같은 플레이스홀더는 절대 변경하지 말 것
-6. 단락 구조 유지 (빈 줄로 단락 구분)
+5. HTML 태그를 반드시 그대로 유지하세요:
+   - <strong>, <b> (볼드), <em>, <i> (이탤릭) 태그는 원문과 동일하게 보존
+   - <a href="..."> 링크 태그의 href 속성과 구조를 그대로 유지
+   - <!--BLOCK_SEP--> 구분자는 절대 변경하거나 삭제하지 마세요
+6. ___MEDIA_0___ 같은 플레이스홀더는 절대 변경하지 말 것
 7. 번역된 텍스트만 출력 (설명 없음)
 
 일본어 텍스트:
-{text}"""
+{html_text}"""
 
         result = self._call_api(prompt, max_tokens=4096)
         if not result:
-            print(f"❌ 청크 번역 실패 — 원문 반환 방지 (원문 길이: {len(text)}자)")
+            print(f"❌ 청크 번역 실패 — 원문 반환 방지 (원문 길이: {len(html_text)}자)")
             return ""
         return result
 
@@ -446,9 +494,24 @@ class NewsTranslator:
                         next_elem.decompose()
                         next_elem = temp
 
-            for tag in content_div(['script', 'style', 'iframe', 'noscript',
+            for tag in content_div(['script', 'style', 'noscript',
                                     'form', 'nav', 'aside', 'footer', 'header']):
                 tag.decompose()
+
+            # 광고 iframe 제거, 동영상 iframe 보존
+            video_domains = ['youtube', 'youtu.be', 'vimeo', 'dailymotion', 'player']
+            for iframe in list(content_div.find_all('iframe')):
+                src = iframe.get('src', '')
+                if not any(v in src.lower() for v in video_domains):
+                    iframe.decompose()
+
+            # 원문 사이트 네비게이션/카테고리 요소 제거
+            nav_keywords = ['ニュース一覧', '뉴스 목록', 'ニュース', '展示レポート',
+                            '전시 리포트', '전시회', 'コラム一覧', 'レビュー一覧']
+            for elem in content_div.find_all(['a', 'span', 'div', 'p']):
+                text = elem.get_text(strip=True)
+                if text and any(kw in text for kw in nav_keywords) and len(text) < 30:
+                    elem.decompose()
 
             social_classes = ['social-share', 'share-buttons', 'sns-share', 'social-links',
                                'share-links', 'addtoany', 'sharedaddy', 'jp-relatedposts',
