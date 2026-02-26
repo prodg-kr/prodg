@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
-pronews.jp 자동 번역 시스템 v5
-파이프라인: 일본어 원문 → Groq 1차 번역 → Gemini 2차 SEO 편집 → WordPress 게시
+pronews.jp 자동 번역 시스템 v6
+파이프라인: 일본어 원문 → Gemini 번역+SEO편집 통합 → WordPress 게시
 
-v4 → v5 변경사항:
-- POST_STATUS 환경변수 추가: publish(즉시공개) / draft(임시저장) 선택 가능
-- excerpt(요약문) 자동 생성 → WordPress SEO 메타 활용
+v5 → v6 변경사항:
+- Groq 제거 → Gemini 단일 엔진으로 통합
+  (Groq llama-3.3-70b의 일본어→한국어 품질 문제 해결)
+- 번역+SEO편집을 단일 프롬프트로 처리 (문맥 일관성 향상)
+- 제목 잘림 문제 수정: 제품명 포함 시 50자까지 허용
+- 일본어 잔존 감지 후 재번역 안전망 추가
+- POST_STATUS: publish / draft 선택 가능
+- excerpt 자동 생성
 - 중복 방지: posted_articles.json + WordPress API 2중 체크
 - 게시 후 posted_articles.json git 자동 커밋
-- 문체: ~합니다 합쇼체 강제
 """
 
 import os
@@ -30,85 +34,96 @@ import re
 WORDPRESS_URL          = "https://prodg.kr"
 WORDPRESS_USER         = os.environ.get("WP_USER")
 WORDPRESS_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD")
-GROQ_API_KEY           = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY         = os.environ.get("GEMINI_API_KEY")
 PRONEWS_RSS            = "https://jp.pronews.com/feed"
 POSTED_ARTICLES_FILE   = "posted_articles.json"
 FORCE_UPDATE           = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
 DAILY_LIMIT            = 10  # 하루 최대 게시 건수
 
-# 게시 상태: publish(즉시 공개) / draft(임시저장 후 수동 검수)
-# GitHub Actions workflow_dispatch에서 선택 가능
+# 게시 상태: publish(즉시공개) / draft(임시저장 후 수동 검수)
 POST_STATUS      = os.environ.get("POST_STATUS", "publish")
 GENERATE_EXCERPT = True  # WordPress SEO용 요약문 자동 생성
 
-# 모델 설정 (환경변수로 언제든 교체 가능)
-GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "llama-3.3-70b-versatile")
+# 모델 설정 (환경변수로 교체 가능)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# API 엔드포인트
-GROQ_API_URL   = "https://api.groq.com/openai/v1/chat/completions"
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-
 
 # ==========================================
-# Groq 번역기 (1차: 일본어 → 한국어 직역)
+# Gemini 통합 엔진 (번역 + SEO 편집)
 # ==========================================
-class GroqTranslator:
+class GeminiEngine:
     """
-    Groq API로 일본어 → 한국어 번역
-    - 모델: llama-3.3-70b-versatile (무료, 분당 30회, 일 14,400회)
-    - 역할: 빠르고 정확한 직역 (SEO 편집은 Gemini가 담당)
-    - HTML 처리: 태그 제거 후 텍스트만 번역, 단락 구조 유지
+    Gemini 단일 엔진으로 번역+SEO편집 통합 처리
+    - 일본어 → 한국어 번역 (Groq 대비 품질 대폭 향상)
+    - SEO 최적화 제목 재작성
+    - 합쇼체(~합니다) 문체 통일
+    - 전문용어 정확성 보정
+    - excerpt 생성
     """
 
     def __init__(self):
-        self.api_key = GROQ_API_KEY
+        self.api_key = GEMINI_API_KEY
         if not self.api_key:
-            print("❌ GROQ_API_KEY 미설정")
+            print("❌ GEMINI_API_KEY 미설정")
             sys.exit(1)
 
-    def _call_api(self, messages: list, max_tokens: int = 4096) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
+    def _call_api(self, prompt: str, max_tokens: int = 4096) -> str:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent?key={self.api_key}"
+        )
         payload = {
-            "model": GROQ_MODEL,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": 0.3  # 번역은 낮은 temperature (일관성 우선)
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": 0.4
+            }
         }
         try:
-            res = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=60)
+            res = requests.post(url, json=payload, timeout=90)
             res.raise_for_status()
-            return res.json()["choices"][0]["message"]["content"].strip()
+            candidates = res.json().get("candidates", [])
+            if candidates:
+                return candidates[0]["content"]["parts"][0]["text"].strip()
+            return ""
         except Exception as e:
-            print(f"⚠️ Groq API 오류: {e}")
+            print(f"⚠️ Gemini API 오류: {e}")
             return ""
 
-    def translate_title(self, title_ja: str) -> str:
-        """제목 번역"""
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a professional Japanese to Korean translator specializing in "
-                    "video production and camera industry news. "
-                    "Translate the given Japanese title to Korean accurately. "
-                    "Output only the translated title, nothing else."
-                )
-            },
-            {"role": "user", "content": f"다음 일본어 제목을 한국어로 번역하세요:\n{title_ja}"}
-        ]
-        result = self._call_api(messages, max_tokens=200)
-        return result if result else title_ja
-
-    def translate_content(self, html_content: str) -> str:
+    def translate_and_edit_title(self, title_ja: str) -> str:
         """
-        본문 번역
-        - HTML에서 텍스트 추출 → 청크 분할 번역 → HTML 재조립
-        - 이미지/헤더 태그는 플레이스홀더로 보존
+        제목 번역 + SEO 편집 통합
+        - 제품명/모델명 절대 잘리지 않도록 보호
+        - 제품명 포함 시 50자까지 허용, 일반 제목은 35자 내외
+        """
+        prompt = f"""당신은 영상/카메라 전문 미디어의 SEO 에디터입니다.
+
+일본어 제목: {title_ja}
+
+위 제목을 한국어로 번역하고 구글 SEO에 최적화하세요.
+
+규칙:
+1. Sony, Canon, Nikon, DJI, Blackmagic, NIKKOR, LUMIX, FUJIFILM 등 브랜드명/제품명/모델명은 원문 그대로 유지하고 절대 생략하지 마세요
+2. 모델 번호(예: NIKKOR Z 70-200mm f/2.8 VR S II)가 있으면 반드시 전체 포함
+3. 검색 핵심 키워드를 앞쪽에 배치
+4. 자연스러운 한국어 (직역체, 어색한 조사 금지)
+5. 제품명 없는 경우 35자 내외, 제품명 포함 시 50자까지 허용
+6. 제목만 출력 (설명, 따옴표, 번호 없음)"""
+
+        result = self._call_api(prompt, max_tokens=150)
+        if result:
+            result = re.sub(r'^[\d\.\)\-\s"\'「」【】]+', '', result).strip().strip('"\'「」【】')
+            print(f"   📌 번역 제목: {result}")
+            return result
+        return title_ja
+
+    def translate_and_edit_content(self, html_content: str) -> str:
+        """
+        본문 번역 + SEO 편집 통합 (Gemini 단일 처리)
+        - 일본어 → 한국어 번역 (문맥 일관성 유지)
+        - 직역체 → 자연스러운 합쇼체
+        - HTML 태그 구조 유지
+        - 일본어 잔존 시 재번역
         """
         if not html_content:
             return ""
@@ -140,22 +155,25 @@ class GroqTranslator:
             full_text = soup.get_text(separator='\n', strip=True)
             paragraphs = [line for line in full_text.split('\n') if line.strip()]
 
-        # 청크 단위 번역 (청크당 최대 2000자)
+        if not paragraphs:
+            return html_content
+
+        # 청크 단위 번역+편집 (Gemini 토큰 한도 고려, 청크당 3000자)
         translated_paragraphs = []
         chunk, chunk_size = [], 0
 
         for para in paragraphs:
-            if chunk_size + len(para) > 2000 and chunk:
-                translated = self._translate_chunk('\n\n'.join(chunk))
-                translated_paragraphs.extend(translated.split('\n\n'))
+            if chunk_size + len(para) > 3000 and chunk:
+                result = self._translate_chunk('\n\n'.join(chunk))
+                translated_paragraphs.extend(result.split('\n\n'))
                 chunk, chunk_size = [], 0
-                time.sleep(0.5)
+                time.sleep(1)
             chunk.append(para)
             chunk_size += len(para)
 
         if chunk:
-            translated = self._translate_chunk('\n\n'.join(chunk))
-            translated_paragraphs.extend(translated.split('\n\n'))
+            result = self._translate_chunk('\n\n'.join(chunk))
+            translated_paragraphs.extend(result.split('\n\n'))
 
         # HTML 재조립
         translated_html = ""
@@ -168,10 +186,10 @@ class GroqTranslator:
             else:
                 translated_html += f"<p>{para}</p>\n"
 
-        # 헤더 태그 복원
+        # 헤더 태그 복원 (헤더 텍스트도 번역)
         for placeholder, info in headers_map.items():
             if placeholder in translated_html:
-                header_ko = self._translate_chunk(info['text']) if info['text'] else info['text']
+                header_ko = self._translate_single(info['text']) if info['text'] else info['text']
                 translated_html = translated_html.replace(
                     placeholder,
                     f"<{info['tag']}>{header_ko}</{info['tag']}>"
@@ -181,168 +199,72 @@ class GroqTranslator:
         for placeholder, img_tag in images.items():
             translated_html = translated_html.replace(placeholder, img_tag)
 
+        # 일본어 잔존 검사 → 잔존 시 재번역
+        if self._has_japanese(translated_html):
+            print("   ⚠️ 일본어 잔존 감지 → 재번역 시도...")
+            translated_html = self._cleanup_japanese(translated_html)
+
         return translated_html
 
     def _translate_chunk(self, text: str) -> str:
-        """텍스트 청크 번역"""
+        """텍스트 청크 번역 + SEO 편집 통합 프롬프트"""
         if not text.strip():
             return text
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a professional Japanese to Korean translator specializing in "
-                    "video production, broadcasting, and camera industry content. "
-                    "Translate accurately while preserving paragraph structure. "
-                    "Keep technical terms, product names, model numbers, and brand names as-is. "
-                    "Keep placeholders like ___IMG_0___ or ___H0_h2___ unchanged. "
-                    "Output only the translated text, nothing else."
-                )
-            },
-            {"role": "user", "content": f"다음 일본어를 한국어로 번역하세요:\n\n{text}"}
-        ]
-        result = self._call_api(messages, max_tokens=4096)
-        return result if result else text
 
-
-# ==========================================
-# Gemini SEO 편집기 (2차: 직역 → SEO 최적화)
-# ==========================================
-class GeminiEditor:
-    """
-    Gemini 2.5 Flash로 번역된 한국어를 SEO 최적화 편집
-    - 역할: 자연스러운 한국어 윤문 + SEO 제목 재작성 + 전문용어 보정
-    - 비용: 무료 플랜 (3개월), 10건/일 × 2호출 = 20회/일 (한도 500회 대비 여유)
-    - 모델 변경: GEMINI_MODEL 환경변수로 교체 가능
-    """
-
-    def __init__(self):
-        self.api_key = GEMINI_API_KEY
-        self.enabled = bool(self.api_key)
-        if not self.enabled:
-            print("⚠️ GEMINI_API_KEY 미설정 → SEO 편집 건너뜀 (Groq 번역 결과만 사용)")
-
-    def _call_api(self, prompt: str, max_tokens: int = 2048) -> str:
-        if not self.enabled:
-            return ""
-        # GEMINI_MODEL이 환경변수로 변경될 수 있으므로 매 호출시 URL 재생성
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{GEMINI_MODEL}:generateContent?key={self.api_key}"
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                "temperature": 0.7
-            }
-        }
-        try:
-            res = requests.post(url, json=payload, timeout=60)
-            res.raise_for_status()
-            candidates = res.json().get("candidates", [])
-            if candidates:
-                return candidates[0]["content"]["parts"][0]["text"].strip()
-            return ""
-        except Exception as e:
-            print(f"⚠️ Gemini API 오류: {e}")
-            return ""
-
-    def edit_title(self, title_ko: str, title_ja: str) -> str:
-        """제목 SEO 편집 - 핵심 키워드 앞배치, 30자 내외"""
-        if not self.enabled:
-            return title_ko
-
-        prompt = f"""당신은 영상/카메라 전문 미디어의 SEO 에디터입니다.
-
-일본어 원제: {title_ja}
-번역된 제목: {title_ko}
-
-구글 검색 최적화된 한국어 제목을 작성하세요.
-
-규칙:
-1. 핵심 제품명/브랜드명 반드시 포함 (Sony, Canon, DJI, Blackmagic, DaVinci 등 원문 표기 유지)
-2. 검색 핵심 키워드를 앞쪽에 배치
-3. 자연스러운 한국어 (직역체, 어색한 조사 금지)
-4. 30자 내외 (최대 40자)
-5. 제목만 출력 (설명, 따옴표, 번호 없음)"""
-
-        result = self._call_api(prompt, max_tokens=100)
-        if result:
-            result = re.sub(r'^[\d\.\)\-\s"\'「」]+', '', result).strip().strip('"\'「」')
-            print(f"   ✏️ SEO 제목: {result}")
-            return result
-        return title_ko
-
-    def edit_content(self, content_ko: str) -> str:
-        """본문 SEO 편집 - 직역체 윤문, 전문용어 보정, HTML 태그 유지"""
-        if not self.enabled or not content_ko:
-            return content_ko
-
-        if len(content_ko) <= 3000:
-            return self._edit_chunk(content_ko)
-
-        # 장문은 <p> 태그 기준 청크 분할
-        chunks = self._split_html_chunks(content_ko, max_chars=3000)
-        edited_chunks = []
-        for i, chunk in enumerate(chunks):
-            print(f"   📝 Gemini 편집 중... ({i+1}/{len(chunks)})")
-            edited = self._edit_chunk(chunk)
-            edited_chunks.append(edited if edited else chunk)
-            time.sleep(1)
-        return "\n".join(edited_chunks)
-
-    def _edit_chunk(self, html_chunk: str) -> str:
         prompt = f"""당신은 영상/카메라 전문 미디어의 한국어 에디터입니다.
 
-아래는 일본어 기사를 AI가 번역한 한국어 HTML 본문입니다.
-직역체를 자연스러운 한국어로 윤문하고 SEO를 최적화하세요.
+아래 일본어 텍스트를 한국어로 번역하고 자연스럽게 편집하세요.
 
-편집 규칙:
-1. HTML 태그(<p>, <h2>, <h3>, <img> 등)는 반드시 그대로 유지
-2. 직역체, 어색한 조사, 일본식 표현을 자연스러운 한국어로 수정
-3. 문체는 반드시 '~합니다', '~했습니다', '~입니다' 등 합쇼체(격식체)로 통일
-   - '~한다', '~했다', '~이다' 등 평서체 사용 금지
-   - '~해요', '~예요' 등 해요체 사용 금지
+번역+편집 규칙:
+1. 일본어를 완전히 한국어로 번역 (히라가나·가타카나·한자 단어 절대 남기지 말 것)
+2. 문체는 반드시 '~합니다', '~했습니다', '~입니다' 합쇼체로 통일
+   ('~한다', '~했다', '~이다' 평서체 사용 금지)
+3. 직역체, 어색한 조사, 일본식 표현을 자연스러운 한국어로 수정
 4. 영상/카메라 전문용어 정확히 표기:
    - 브랜드명: Sony, Canon, Nikon, DJI, Blackmagic, DaVinci Resolve 등 원문 유지
-   - 해상도: 4K, 8K, Full HD
-   - 프레임레이트: fps, 24p, 60p
-   - 기타: 코덱, 비트레이트, 조리개, 셔터스피드 등 정확한 한국어 사용
-5. 단락 구조와 문장 수 유지 (내용 추가/삭제 금지)
-6. HTML만 출력 (설명 텍스트 없음)
+   - 해상도: 4K, 8K, Full HD / 프레임레이트: fps, 24p, 60p
+   - 기타: 코덱, 비트레이트, 조리개, 셔터스피드, 보케, 손떨림보정 등
+5. ___IMG_0___, ___H0_h2___ 같은 플레이스홀더는 절대 변경하지 말 것
+6. 단락 구조 유지 (빈 줄로 단락 구분)
+7. 번역된 텍스트만 출력 (설명 없음)
 
-번역된 HTML:
-{html_chunk}"""
+일본어 텍스트:
+{text}"""
 
         result = self._call_api(prompt, max_tokens=4096)
-        return result if result else html_chunk
+        return result if result else text
 
-    def _split_html_chunks(self, html: str, max_chars: int = 3000) -> list:
-        """<p> 태그 경계 기준으로 HTML 청크 분할"""
-        chunks = []
-        current_chunk = ""
-        parts = re.split(r'(?=<p>)', html)
-        for part in parts:
-            if len(current_chunk) + len(part) > max_chars and current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = part
-            else:
-                current_chunk += part
-        if current_chunk:
-            chunks.append(current_chunk)
-        return chunks if chunks else [html]
+    def _translate_single(self, text: str) -> str:
+        """단일 짧은 텍스트 번역 (헤더용)"""
+        if not text.strip():
+            return text
+        prompt = f"다음 일본어를 자연스러운 한국어 합쇼체로 번역하세요. 번역문만 출력:\n{text}"
+        result = self._call_api(prompt, max_tokens=200)
+        return result if result else text
+
+    def _has_japanese(self, text: str) -> bool:
+        """일본어(히라가나·가타카나) 잔존 여부 검사"""
+        japanese_pattern = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
+        plain_text = BeautifulSoup(text, 'lxml').get_text()
+        matches = japanese_pattern.findall(plain_text)
+        return len(matches) > 5  # 5자 이상 일본어 잔존 시 재번역
+
+    def _cleanup_japanese(self, html: str) -> str:
+        """일본어 잔존 부분만 재번역"""
+        soup = BeautifulSoup(html, 'lxml')
+        for elem in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li']):
+            text = elem.get_text()
+            if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):
+                translated = self._translate_single(text)
+                if translated:
+                    elem.string = translated
+        return str(soup.find('body') or soup)
 
     def generate_excerpt(self, title_ko: str, content_ko: str) -> str:
         """
         WordPress SEO용 요약문(excerpt) 생성
-        - 80자 내외, 핵심 키워드 포함
-        - 검색결과 스니펫에 노출되는 문장
+        - 80자 내외, 검색결과 스니펫에 최적화
         """
-        if not self.enabled:
-            return ""
-
-        # 본문에서 텍스트만 추출 (HTML 태그 제거)
         soup = BeautifulSoup(content_ko, 'lxml')
         plain_text = soup.get_text(separator=' ', strip=True)[:500]
 
@@ -357,13 +279,13 @@ class GeminiEditor:
 1. 80자 내외 (최대 100자)
 2. 핵심 키워드 자연스럽게 포함
 3. 독자가 클릭하고 싶어지는 문장
-4. ~합니다 체로 작성
+4. ~합니다 합쇼체로 작성
 5. 요약문만 출력 (설명 없음)"""
 
         result = self._call_api(prompt, max_tokens=150)
         if result:
             result = result.strip().strip('"\'')
-            print(f"   📋 요약문: {result[:50]}...")
+            print(f"   📋 요약문: {result[:60]}...")
             return result
         return ""
 
@@ -373,8 +295,7 @@ class GeminiEditor:
 # ==========================================
 class NewsTranslator:
     def __init__(self):
-        self.groq = GroqTranslator()
-        self.gemini = GeminiEditor()
+        self.gemini = GeminiEngine()
         self.wordpress_api = f"{WORDPRESS_URL}/wp-json/wp/v2"
         self.posted_articles = self.load_posted_articles()
 
@@ -395,7 +316,7 @@ class NewsTranslator:
         """
         RSS 피드에서 미게시 기사 조회
         - 최신순 정렬
-        - 최신 기사가 10건 미만이면 과거 미게시 기사로 채워 항상 최대 10건 반환
+        - 최신 기사 부족 시 과거 미게시 기사로 채워 최대 10건 반환
         """
         print(f"📡 RSS 피드 확인 중: {PRONEWS_RSS}")
         feed = feedparser.parse(PRONEWS_RSS)
@@ -416,11 +337,10 @@ class NewsTranslator:
                 'date': article_date
             })
 
-        # 최신순 정렬 후 최대 10건 (최신 + 과거 미게시 순서로 자동 채워짐)
         unposted.sort(key=lambda x: x['date'], reverse=True)
         target = unposted[:DAILY_LIMIT]
 
-        print(f"✅ 미게시 기사: {len(unposted)}건 → 오늘 처리: {len(target)}건 (최대 {DAILY_LIMIT}건)")
+        print(f"✅ 미게시: {len(unposted)}건 → 오늘 처리: {len(target)}건 (최대 {DAILY_LIMIT}건)")
         return target
 
     def fetch_full_content(self, url: str):
@@ -450,7 +370,8 @@ class NewsTranslator:
                     parent.decompose()
 
             remove_headings = ['백 넘버', '関連キーワード', 'バックナンバー',
-                               'この記事をシェア', '이 기사 공유', 'FOLLOW US', '関連記事', '관련 기사']
+                               'この記事をシェア', '이 기사 공유', 'FOLLOW US',
+                               '関連記事', '관련 기사']
             for h_tag in content_div.find_all(['h2', 'h3', 'h4']):
                 if any(kw in h_tag.get_text(strip=True) for kw in remove_headings):
                     next_elem = h_tag.find_next_sibling()
@@ -460,8 +381,8 @@ class NewsTranslator:
                         next_elem.decompose()
                         next_elem = temp
 
-            for tag in content_div(['script', 'style', 'iframe', 'noscript', 'form',
-                                    'nav', 'aside', 'footer', 'header']):
+            for tag in content_div(['script', 'style', 'iframe', 'noscript',
+                                    'form', 'nav', 'aside', 'footer', 'header']):
                 tag.decompose()
 
             social_classes = ['social-share', 'share-buttons', 'sns-share', 'social-links',
@@ -564,47 +485,34 @@ class NewsTranslator:
             return None
 
     def is_already_posted_on_wp(self, original_url: str) -> bool:
-        """
-        WordPress에서 원문 URL 기준으로 중복 게시 여부 확인
-        - posted_articles.json 캐시 실패 시 2차 안전망 역할
-        - 원문 링크를 본문에 포함하므로 검색으로 찾을 수 있음
-        """
+        """WordPress에서 원문 URL 기준 중복 게시 여부 확인"""
         try:
-            # 원문 URL의 일부로 WordPress 검색
             search_term = original_url.split('/')[-2] if original_url.endswith('/') else original_url.split('/')[-1]
             res = requests.get(
                 f"{self.wordpress_api}/posts",
                 auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
-                params={'search': search_term, 'per_page': 5, 'status': 'publish'},
+                params={'search': search_term, 'per_page': 5, 'status': 'any'},
                 timeout=10
             )
             if res.status_code == 200:
-                posts = res.json()
-                for post in posts:
+                for post in res.json():
                     if original_url in post.get('content', {}).get('rendered', ''):
                         print(f"⚠️ 중복 감지 → 스킵: {post['link']}")
                         return True
             return False
         except Exception as e:
             print(f"⚠️ 중복 체크 오류 (계속 진행): {e}")
-            return False  # 오류 시 게시 진행 (보수적 처리)
+            return False
 
     def commit_posted_articles(self):
-        """
-        posted_articles.json을 git 저장소에 커밋
-        - GitHub Actions 캐시 대신 git으로 영구 보존
-        - 캐시가 날아가도 중복 게시 방지
-        """
+        """posted_articles.json git 커밋 (캐시 유실 방지)"""
         try:
             import subprocess
             subprocess.run(['git', 'config', 'user.email', 'action@github.com'], check=True)
             subprocess.run(['git', 'config', 'user.name', 'GitHub Action'], check=True)
             subprocess.run(['git', 'add', POSTED_ARTICLES_FILE], check=True)
-            result = subprocess.run(
-                ['git', 'diff', '--cached', '--quiet'],
-                capture_output=True
-            )
-            if result.returncode != 0:  # 변경사항 있을 때만 커밋
+            result = subprocess.run(['git', 'diff', '--cached', '--quiet'], capture_output=True)
+            if result.returncode != 0:
                 subprocess.run(
                     ['git', 'commit', '-m', f'chore: update posted_articles [{datetime.now().strftime("%Y-%m-%d %H:%M")}]'],
                     check=True
@@ -627,7 +535,6 @@ class NewsTranslator:
         }
         if excerpt:
             post_data['excerpt'] = excerpt
-
         try:
             res = requests.post(
                 f"{self.wordpress_api}/posts",
@@ -636,8 +543,8 @@ class NewsTranslator:
             )
             res.raise_for_status()
             post_info = res.json()
-            status_label = "📝 임시저장" if status == "draft" else "✨ 게시 성공"
-            print(f"{status_label}: {post_info['link']}")
+            label = "📝 임시저장" if status == "draft" else "✨ 게시 성공"
+            print(f"{label}: {post_info['link']}")
             return True
         except Exception as e:
             print(f"❌ 게시 실패: {e}")
@@ -647,11 +554,11 @@ class NewsTranslator:
 
     def process_article(self, article: dict) -> bool:
         print(f"\n{'='*60}")
-        print(f"📰 {article['title'][:60]}")
+        print(f"📰 {article['title'][:70]}")
         print(f"📅 {article['date'].strftime('%Y-%m-%d %H:%M')}")
         print(f"{'='*60}")
 
-        # 1. 중복 체크 (posted_articles.json + WordPress 2중 확인)
+        # 1. 중복 체크 (2중 안전망)
         if not FORCE_UPDATE and self.is_already_posted_on_wp(article['link']):
             if article['link'] not in self.posted_articles:
                 self.posted_articles.append(article['link'])
@@ -664,22 +571,20 @@ class NewsTranslator:
             print("⚠️ 본문 스크래핑 실패 → 스킵")
             return False
 
-        # 3. Groq 1차 번역
-        print("🔄 [1단계] Groq 번역 중...")
-        title_ko_raw = self.groq.translate_title(article['title'])
-        content_ko_raw = self.groq.translate_content(raw_html)
-        print(f"   번역 제목: {title_ko_raw}")
+        # 3. Gemini 제목 번역 + SEO 편집
+        print("🔄 [1단계] Gemini 제목 번역+편집 중...")
+        title_ko = self.gemini.translate_and_edit_title(article['title'])
 
-        # 4. Gemini 2차 SEO 편집
-        print("✏️  [2단계] Gemini SEO 편집 중...")
-        title_ko = self.gemini.edit_title(title_ko_raw, article['title'])
-        content_ko = self.gemini.edit_content(content_ko_raw)
+        # 4. Gemini 본문 번역 + SEO 편집
+        print("✏️  [2단계] Gemini 본문 번역+편집 중...")
+        content_ko = self.gemini.translate_and_edit_content(raw_html)
 
-        # 5. excerpt 생성 (SEO 메타 디스크립션)
+        # 5. excerpt 생성
         excerpt = ""
         if GENERATE_EXCERPT:
             print("📋 [3단계] excerpt 생성 중...")
             excerpt = self.gemini.generate_excerpt(title_ko, content_ko)
+            time.sleep(1)
 
         # 6. Slug 생성
         slug = self.generate_slug(article['title'], article['date'])
@@ -700,7 +605,7 @@ class NewsTranslator:
                 except:
                     pass
 
-        # 7. 최종 본문 구성 + 원문 출처
+        # 8. 최종 본문 구성 + 원문 출처
         final_content = content_ko
         final_content += (
             "\n\n<hr style='margin:40px 0 20px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
@@ -710,9 +615,9 @@ class NewsTranslator:
             f"</p>"
         )
 
-        # 8. WordPress 게시 (publish or draft)
-        status_label = "draft(임시저장)" if POST_STATUS == "draft" else "publish(즉시공개)"
-        print(f"📤 WordPress {status_label} 중...")
+        # 9. WordPress 게시
+        label = "draft(임시저장)" if POST_STATUS == "draft" else "publish(즉시공개)"
+        print(f"📤 [4단계] WordPress {label} 중...")
         if self.post_to_wordpress(title_ko, final_content, slug, featured_id,
                                    article['date'], excerpt=excerpt, status=POST_STATUS):
             if not FORCE_UPDATE:
@@ -723,9 +628,8 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v5")
-        print(f"번역: Groq ({GROQ_MODEL})")
-        print(f"편집: Gemini ({GEMINI_MODEL})")
+        print(f"pronews.jp → prodg.kr 자동 번역 v6")
+        print(f"엔진: Gemini 단일 ({GEMINI_MODEL})")
         print(f"게시: {POST_STATUS.upper()} ({'즉시 공개' if POST_STATUS == 'publish' else '임시저장 → 수동 검수'})")
         print(f"일일 한도: 최대 {DAILY_LIMIT}건")
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -751,7 +655,6 @@ class NewsTranslator:
         print(f"🏁 완료: {success}/{len(articles)}건 게시")
         print(f"{'='*60}\n")
 
-        # 게시 기록 git 커밋 (캐시 유실 방지)
         if success > 0:
             self.commit_posted_articles()
 
