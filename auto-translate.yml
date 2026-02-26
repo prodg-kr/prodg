@@ -1,0 +1,74 @@
+name: pronews.jp 자동 번역 및 게시 v6
+
+on:
+  schedule:
+    - cron: '0 22 * * *'  # 매일 KST 07:00
+
+  workflow_dispatch:
+    inputs:
+      post_status:
+        description: '게시 상태: publish(즉시공개) / draft(임시저장)'
+        required: false
+        default: 'publish'
+        type: choice
+        options:
+          - publish
+          - draft
+      force_update:
+        description: '이미 게시된 기사도 재처리 (true/false)'
+        required: false
+        default: 'false'
+      gemini_model:
+        description: 'Gemini 모델 변경 (기본: gemini-2.5-flash)'
+        required: false
+        default: 'gemini-2.5-flash'
+
+jobs:
+  translate-and-post:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: 코드 체크아웃
+      uses: actions/checkout@v4
+
+    - name: Python 설정
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: 의존성 설치
+      run: pip install -r requirements.txt
+
+    - name: 이전 게시 기록 복원
+      uses: actions/cache@v4
+      with:
+        path: posted_articles.json
+        key: posted-articles-${{ github.run_id }}
+        restore-keys: |
+          posted-articles-
+
+    - name: pronews.jp 번역 및 게시 실행
+      env:
+        WP_USER: ${{ secrets.WP_USER }}
+        WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        POST_STATUS: ${{ github.event.inputs.post_status || 'publish' }}
+        FORCE_UPDATE: ${{ github.event.inputs.force_update || 'false' }}
+        GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-2.5-flash' }}
+      run: python translate_and_post.py
+
+    - name: 게시 기록 저장
+      uses: actions/cache/save@v4
+      if: always()
+      with:
+        path: posted_articles.json
+        key: posted-articles-${{ github.run_id }}
+
+    - name: 완료 알림
+      if: always()
+      run: |
+        echo "✅ 작업 완료: $(date)"
+        echo "다음 실행: 내일 오전 7시 (KST)"
