@@ -41,7 +41,7 @@ FORCE_UPDATE           = os.environ.get("FORCE_UPDATE", "false").lower() == "tru
 DAILY_LIMIT            = 10  # 하루 최대 게시 건수
 
 # 게시 상태: publish(즉시공개) / draft(임시저장 후 수동 검수)
-POST_STATUS      = os.environ.get("POST_STATUS", "publish")
+POST_STATUS      = os.environ.get("POST_STATUS", "draft")
 GENERATE_EXCERPT = True  # WordPress SEO용 요약문 자동 생성
 
 # 모델 설정 (환경변수로 교체 가능)
@@ -66,8 +66,15 @@ class GeminiEngine:
         if not self.api_key:
             print("❌ GEMINI_API_KEY 미설정")
             sys.exit(1)
+        self.last_api_call = 0.0  # 무료 티어 RPM 제어를 위한 변수
 
     def _call_api(self, prompt: str, max_tokens: int = 4096) -> str:
+        # 무료 티어 제약 (15 RPM) 우회: 호출 간 최소 4.5초 대기 보장
+        elapsed = time.time() - self.last_api_call
+        if elapsed < 4.5:
+            time.sleep(4.5 - elapsed)
+        self.last_api_call = time.time()
+
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{GEMINI_MODEL}:generateContent?key={self.api_key}"
@@ -336,7 +343,8 @@ class GeminiEngine:
    - <a href="..."> 링크 태그의 href 속성과 구조를 그대로 유지
    - <!--BLOCK_SEP--> 구분자는 절대 변경하거나 삭제하지 마세요
 6. ___MEDIA_0___ 같은 플레이스홀더는 절대 변경하지 말 것
-7. 번역된 텍스트만 출력 (설명 없음)
+7. 기계 번역 느낌이 나지 않도록, 사람이 직접 작성한 듯한 자연스러운 한국어 문장 구조로 재작성(Paraphrase)할 것. (Google SEO 및 AdSense 품질 문서 승인을 위해 매우 중요)
+8. 번역된 텍스트만 출력 (설명 없음)
 
 일본어 텍스트:
 {html_text}"""
@@ -363,14 +371,20 @@ class GeminiEngine:
         return len(matches) > 5  # 5자 이상 일본어 잔존 시 재번역
 
     def _cleanup_japanese(self, html: str) -> str:
-        """일본어 잔존 부분만 재번역"""
+        """일본어 잔존 부분만 재번역 (내부 HTML 요소 보존)"""
         soup = BeautifulSoup(html, 'lxml')
         for elem in soup.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li']):
             text = elem.get_text()
             if re.search(r'[\u3040-\u309f\u30a0-\u30ff]', text):
-                translated = self._translate_single(text)
+                inner_html = elem.decode_contents().strip()
+                if not inner_html: continue
+                # _translate_chunk를 사용하여 HTML 태그 구조 유지
+                translated = self._translate_chunk(inner_html)
                 if translated:
-                    elem.string = translated
+                    elem.clear()
+                    new_content = BeautifulSoup(translated, 'html.parser')
+                    for child in list(new_content.children):
+                        elem.append(child)
         return str(soup.find('body') or soup)
 
     def generate_excerpt(self, title_ko: str, content_ko: str) -> str:
@@ -400,6 +414,31 @@ class GeminiEngine:
             result = result.strip().strip('"\'')
             print(f"   📋 요약문: {result[:60]}...")
             return result
+        return ""
+
+    def generate_tldr(self, content_ko: str) -> str:
+        """
+        AdSense 승인 및 SEO를 위한 고품질 핵심 요약(TL;DR) 블록 생성
+        """
+        soup = BeautifulSoup(content_ko, 'lxml')
+        plain_text = soup.get_text(separator=' ', strip=True)[:1500]
+        if not plain_text:
+            return ""
+
+        prompt = f"""당신은 영상/카메라 전문 미디어의 수석 에디터입니다.
+다음 기사 본문을 분석하여 독자들을 위한 '핵심 요약(TL;DR)'을 3~4개의 글머리 기호(Bullet points)로 작성하세요.
+
+규칙:
+1. 각 항목은 '~합니다', '~했습니다' 등 합쇼체로 끝날 것.
+2. 구글 SEO와 AdSense 승인 기준(전문성, 독창성)을 충족하도록 기계 번역 느낌 없이 사람이 직접 요약한 것처럼 고품질로 작성.
+3. HTML 태그 <ul>과 <li>를 사용하여 출력.
+4. 설명이나 마크다운 백틱(```) 없이 순수 HTML 코드만 출력.
+
+기사 본문:
+{plain_text}"""
+        result = self._call_api(prompt, max_tokens=300)
+        if result:
+            return result.replace("```html", "").replace("```", "").strip()
         return ""
 
 
@@ -544,18 +583,17 @@ class NewsTranslator:
             print(f"⚠️ 스크래핑 실패: {e}")
             return None
 
-    def generate_slug(self, title_ja: str, article_date: datetime) -> str:
-        """영문 slug 생성 (영문 키워드 + 날짜)"""
-        words = title_ja.split()
-        slug_words = []
-        for word in words[:6]:
-            cleaned = re.sub(r'[^a-zA-Z0-9\-]', '', word.lower())
-            if cleaned and len(cleaned) > 2:
-                slug_words.append(cleaned)
-
+    def generate_seo_slug(self, title_ko: str, article_date: datetime) -> str:
+        """영문 slug 생성 (AI 활용 SEO 최적화)"""
+        prompt = f"다음 한국어 제목을 URL 슬러그에 사용할 수 있는 3~5단어의 의미 있는 영문으로 번역하세요. 띄어쓰기는 하이픈(-)으로 처리하고 특수문자는 제외하세요. 오직 영어 슬러그 문자열만 출력:\n{title_ko}"
+        result = self.gemini._call_api(prompt, max_tokens=50)
         date_str = article_date.strftime('%Y%m%d')
-        slug = ('-'.join(slug_words[:4]) + f"-{date_str}") if slug_words else f"article-{date_str}-{int(time.time())}"
-        return slug[:60]
+        if result:
+            slug = re.sub(r'[^a-zA-Z0-9\-]', '-', result).lower()
+            slug = re.sub(r'-+', '-', slug).strip('-')
+            if len(slug) > 3:
+                return f"{slug[:60]}-{date_str}"
+        return f"article-{date_str}-{int(time.time())}"
 
     def get_main_image_url(self, link: str):
         try:
@@ -725,8 +763,15 @@ class NewsTranslator:
             excerpt = self.gemini.generate_excerpt(title_ko, content_ko)
             time.sleep(1)
 
-        # 6. Slug 생성
-        slug = self.generate_slug(article['title'], article['date'])
+        # 5.1. TL;DR 핵심 요약 (SEO & AdSense 최적화)
+        print("💡 [3.5단계] TL;DR 본문 요약 생성 중...")
+        tldr_html = self.gemini.generate_tldr(content_ko)
+        if tldr_html:
+            print("   ✅ 핵심 요약 생성 완료")
+        time.sleep(1)
+
+        # 6. Slug 생성 (SEO 친화적 영문 슬러그)
+        slug = self.generate_seo_slug(title_ko, article['date'])
         print(f"🔗 Slug: {slug}")
 
         # 7. 이미지 처리
@@ -745,7 +790,10 @@ class NewsTranslator:
                     pass
 
         # 8. 최종 본문 구성 + 원문 출처
-        final_content = content_ko
+        final_content = ""
+        if tldr_html:
+            final_content += f'<div style="background-color:#f8f9fa; padding:20px; border-radius:8px; border-left:5px solid #0056b3; margin-bottom:30px; box-shadow: 0 2px 4px rgba(0,0,0,0.05);">\n<h3 style="margin-top:0; font-size:18px; color:#0056b3;">💡 핵심 요약</h3>\n{tldr_html}\n</div>\n\n'
+        final_content += content_ko
         final_content += (
             "\n\n<hr style='margin:40px 0 20px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
             f"<p style='font-size:13px;color:#777;'>"
