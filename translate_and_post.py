@@ -79,16 +79,25 @@ class GeminiEngine:
                 "temperature": 0.4
             }
         }
-        try:
-            res = requests.post(url, json=payload, timeout=90)
-            res.raise_for_status()
-            candidates = res.json().get("candidates", [])
-            if candidates:
-                return candidates[0]["content"]["parts"][0]["text"].strip()
-            return ""
-        except Exception as e:
-            print(f"⚠️ Gemini API 오류: {e}")
-            return ""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                res = requests.post(url, json=payload, timeout=90)
+                res.raise_for_status()
+                candidates = res.json().get("candidates", [])
+                if candidates:
+                    return candidates[0]["content"]["parts"][0]["text"].strip()
+                print(f"⚠️ Gemini 응답에 candidates 없음 (시도 {attempt+1}/{max_retries})")
+            except Exception as e:
+                print(f"⚠️ Gemini API 오류 (시도 {attempt+1}/{max_retries}): {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    print(f"   HTTP {e.response.status_code}: {e.response.text[:300]}")
+            if attempt < max_retries - 1:
+                wait = 5 * (attempt + 1)
+                print(f"   ⏳ {wait}초 후 재시도...")
+                time.sleep(wait)
+        print("❌ Gemini API 호출 최종 실패 (3회 시도)")
+        return ""
 
     def translate_and_edit_title(self, title_ja: str) -> str:
         """
@@ -115,7 +124,8 @@ class GeminiEngine:
             result = re.sub(r'^[\d\.\)\-\s"\'「」【】]+', '', result).strip().strip('"\'「」【】')
             print(f"   📌 번역 제목: {result}")
             return result
-        return title_ja
+        print(f"❌ 제목 번역 실패 — 일본어 원문 반환 방지")
+        return ""
 
     def translate_and_edit_content(self, html_content: str) -> str:
         """
@@ -175,6 +185,12 @@ class GeminiEngine:
             result = self._translate_chunk('\n\n'.join(chunk))
             translated_paragraphs.extend(result.split('\n\n'))
 
+        # 번역 결과 검증: 대부분의 청크가 비어있으면 실패 처리
+        non_empty = [p for p in translated_paragraphs if p.strip()]
+        if len(non_empty) < len(paragraphs) * 0.3:
+            print(f"❌ 본문 번역 실패 — 번역된 단락 {len(non_empty)}/{len(paragraphs)}개")
+            return ""
+
         # HTML 재조립
         translated_html = ""
         for para in translated_paragraphs:
@@ -232,7 +248,10 @@ class GeminiEngine:
 {text}"""
 
         result = self._call_api(prompt, max_tokens=4096)
-        return result if result else text
+        if not result:
+            print(f"❌ 청크 번역 실패 — 원문 반환 방지 (원문 길이: {len(text)}자)")
+            return ""
+        return result
 
     def _translate_single(self, text: str) -> str:
         """단일 짧은 텍스트 번역 (헤더용)"""
@@ -574,10 +593,21 @@ class NewsTranslator:
         # 3. Gemini 제목 번역 + SEO 편집
         print("🔄 [1단계] Gemini 제목 번역+편집 중...")
         title_ko = self.gemini.translate_and_edit_title(article['title'])
+        if not title_ko:
+            print("❌ 제목 번역 실패 → 이 기사 스킵")
+            return False
 
         # 4. Gemini 본문 번역 + SEO 편집
         print("✏️  [2단계] Gemini 본문 번역+편집 중...")
         content_ko = self.gemini.translate_and_edit_content(raw_html)
+        if not content_ko:
+            print("❌ 본문 번역 실패 → 이 기사 스킵")
+            return False
+
+        # 최종 안전망: 게시 직전 일본어 잔존 검사
+        if self.gemini._has_japanese(content_ko):
+            print("❌ 최종 검사에서 일본어 다수 잔존 → 이 기사 스킵")
+            return False
 
         # 5. excerpt 생성
         excerpt = ""
@@ -638,6 +668,15 @@ class NewsTranslator:
         if not WORDPRESS_USER or not WORDPRESS_APP_PASSWORD:
             print("❌ WP_USER / WP_APP_PASSWORD 환경변수 필요")
             sys.exit(1)
+
+        # API 키 유효성 사전 테스트
+        print("🔑 Gemini API 키 검증 중...")
+        test_result = self.gemini._call_api("한국어로 번역: テスト", max_tokens=50)
+        if not test_result:
+            print("❌ Gemini API 키가 유효하지 않거나 API에 접근할 수 없습니다.")
+            print("   GEMINI_API_KEY 환경변수를 확인하세요.")
+            sys.exit(1)
+        print(f"   ✅ API 응답 확인: '{test_result}'")
 
         articles = self.fetch_rss_feed()
         if not articles:
