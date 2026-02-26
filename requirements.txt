@@ -1,6 +1,6 @@
 requests==2.31.0
 feedparser==6.0.11
-googletrans==4.0.0rc1
-html2text==2020.1.16
 beautifulsoup4==4.12.3
 lxml==5.1.0
+# googletrans 제거 (Groq API로 대체)
+# google-generativeai 불필요 (requests로 직접 호출)

@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-pronews.jp 자동 번역 시스템 v3 (최종)
-개선사항:
-1. 최신 기사부터 10건씩 번역 (오래된 기사는 나중에)
-2. 원문 게시시각, 출처 텍스트 제거
-3. 영문 slug + 불필요 콘텐츠 제거
+pronews.jp 자동 번역 시스템 v4
+파이프라인: 일본어 원문 → Groq 1차 번역 → Gemini Flash 2차 SEO 편집 → WordPress 게시
+
+v3 → v4 변경사항:
+- googletrans 제거 → Groq API (llama-3.3-70b, 무료, 안정적)
+- 2차 SEO 편집 추가 → Gemini 2.5 Flash (무료 플랜)
+- 하루 최대 10건 제한 (최신 기사 우선, 부족하면 과거 미게시 기사로 채움)
+- 모델명 환경변수로 교체 가능 (GROQ_MODEL, GEMINI_MODEL)
 """
 
 import os
 import sys
 import requests
 import feedparser
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 import json
 import time
 from urllib.parse import urlparse, urljoin
-from googletrans import Translator
-import html2text
 from bs4 import BeautifulSoup
 import hashlib
 import re
@@ -25,20 +26,316 @@ import re
 # ==========================================
 # 설정
 # ==========================================
-WORDPRESS_URL = "https://prodg.kr"
-WORDPRESS_USER = os.environ.get("WP_USER")
+WORDPRESS_URL          = "https://prodg.kr"
+WORDPRESS_USER         = os.environ.get("WP_USER")
 WORDPRESS_APP_PASSWORD = os.environ.get("WP_APP_PASSWORD")
-PRONEWS_RSS = "https://jp.pronews.com/feed"
-POSTED_ARTICLES_FILE = "posted_articles.json"
-FORCE_UPDATE = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
+GROQ_API_KEY           = os.environ.get("GROQ_API_KEY")
+GEMINI_API_KEY         = os.environ.get("GEMINI_API_KEY")
+PRONEWS_RSS            = "https://jp.pronews.com/feed"
+POSTED_ARTICLES_FILE   = "posted_articles.json"
+FORCE_UPDATE           = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
+DAILY_LIMIT            = 10  # 하루 최대 게시 건수
 
+# 모델 설정 (환경변수로 언제든 교체 가능)
+GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "llama-3.3-70b-versatile")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+# API 엔드포인트
+GROQ_API_URL   = "https://api.groq.com/openai/v1/chat/completions"
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+
+# ==========================================
+# Groq 번역기 (1차: 일본어 → 한국어 직역)
+# ==========================================
+class GroqTranslator:
+    """
+    Groq API로 일본어 → 한국어 번역
+    - 모델: llama-3.3-70b-versatile (무료, 분당 30회, 일 14,400회)
+    - 역할: 빠르고 정확한 직역 (SEO 편집은 Gemini가 담당)
+    - HTML 처리: 태그 제거 후 텍스트만 번역, 단락 구조 유지
+    """
+
+    def __init__(self):
+        self.api_key = GROQ_API_KEY
+        if not self.api_key:
+            print("❌ GROQ_API_KEY 미설정")
+            sys.exit(1)
+
+    def _call_api(self, messages: list, max_tokens: int = 4096) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.3  # 번역은 낮은 temperature (일관성 우선)
+        }
+        try:
+            res = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=60)
+            res.raise_for_status()
+            return res.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"⚠️ Groq API 오류: {e}")
+            return ""
+
+    def translate_title(self, title_ja: str) -> str:
+        """제목 번역"""
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional Japanese to Korean translator specializing in "
+                    "video production and camera industry news. "
+                    "Translate the given Japanese title to Korean accurately. "
+                    "Output only the translated title, nothing else."
+                )
+            },
+            {"role": "user", "content": f"다음 일본어 제목을 한국어로 번역하세요:\n{title_ja}"}
+        ]
+        result = self._call_api(messages, max_tokens=200)
+        return result if result else title_ja
+
+    def translate_content(self, html_content: str) -> str:
+        """
+        본문 번역
+        - HTML에서 텍스트 추출 → 청크 분할 번역 → HTML 재조립
+        - 이미지/헤더 태그는 플레이스홀더로 보존
+        """
+        if not html_content:
+            return ""
+
+        soup = BeautifulSoup(html_content, 'lxml')
+
+        # 이미지 태그 보존
+        images = {}
+        for i, img in enumerate(soup.find_all('img')):
+            placeholder = f"___IMG_{i}___"
+            images[placeholder] = str(img)
+            img.replace_with(placeholder)
+
+        # 헤더 태그 보존
+        headers_map = {}
+        for i, tag in enumerate(soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])):
+            placeholder = f"___H{i}_{tag.name}___"
+            headers_map[placeholder] = {'tag': tag.name, 'text': tag.get_text(strip=True)}
+            tag.replace_with(placeholder)
+
+        # 단락 단위 텍스트 추출
+        paragraphs = []
+        for elem in soup.find_all(['p', 'li', 'blockquote']):
+            text = elem.get_text(separator=' ', strip=True)
+            if text and len(text) > 5:
+                paragraphs.append(text)
+
+        if not paragraphs:
+            full_text = soup.get_text(separator='\n', strip=True)
+            paragraphs = [line for line in full_text.split('\n') if line.strip()]
+
+        # 청크 단위 번역 (청크당 최대 2000자)
+        translated_paragraphs = []
+        chunk, chunk_size = [], 0
+
+        for para in paragraphs:
+            if chunk_size + len(para) > 2000 and chunk:
+                translated = self._translate_chunk('\n\n'.join(chunk))
+                translated_paragraphs.extend(translated.split('\n\n'))
+                chunk, chunk_size = [], 0
+                time.sleep(0.5)
+            chunk.append(para)
+            chunk_size += len(para)
+
+        if chunk:
+            translated = self._translate_chunk('\n\n'.join(chunk))
+            translated_paragraphs.extend(translated.split('\n\n'))
+
+        # HTML 재조립
+        translated_html = ""
+        for para in translated_paragraphs:
+            para = para.strip()
+            if not para:
+                continue
+            if para.startswith('___'):
+                translated_html += para + "\n"
+            else:
+                translated_html += f"<p>{para}</p>\n"
+
+        # 헤더 태그 복원
+        for placeholder, info in headers_map.items():
+            if placeholder in translated_html:
+                header_ko = self._translate_chunk(info['text']) if info['text'] else info['text']
+                translated_html = translated_html.replace(
+                    placeholder,
+                    f"<{info['tag']}>{header_ko}</{info['tag']}>"
+                )
+
+        # 이미지 태그 복원
+        for placeholder, img_tag in images.items():
+            translated_html = translated_html.replace(placeholder, img_tag)
+
+        return translated_html
+
+    def _translate_chunk(self, text: str) -> str:
+        """텍스트 청크 번역"""
+        if not text.strip():
+            return text
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional Japanese to Korean translator specializing in "
+                    "video production, broadcasting, and camera industry content. "
+                    "Translate accurately while preserving paragraph structure. "
+                    "Keep technical terms, product names, model numbers, and brand names as-is. "
+                    "Keep placeholders like ___IMG_0___ or ___H0_h2___ unchanged. "
+                    "Output only the translated text, nothing else."
+                )
+            },
+            {"role": "user", "content": f"다음 일본어를 한국어로 번역하세요:\n\n{text}"}
+        ]
+        result = self._call_api(messages, max_tokens=4096)
+        return result if result else text
+
+
+# ==========================================
+# Gemini SEO 편집기 (2차: 직역 → SEO 최적화)
+# ==========================================
+class GeminiEditor:
+    """
+    Gemini 2.5 Flash로 번역된 한국어를 SEO 최적화 편집
+    - 역할: 자연스러운 한국어 윤문 + SEO 제목 재작성 + 전문용어 보정
+    - 비용: 무료 플랜 (3개월), 10건/일 × 2호출 = 20회/일 (한도 500회 대비 여유)
+    - 모델 변경: GEMINI_MODEL 환경변수로 교체 가능
+    """
+
+    def __init__(self):
+        self.api_key = GEMINI_API_KEY
+        self.enabled = bool(self.api_key)
+        if not self.enabled:
+            print("⚠️ GEMINI_API_KEY 미설정 → SEO 편집 건너뜀 (Groq 번역 결과만 사용)")
+
+    def _call_api(self, prompt: str, max_tokens: int = 2048) -> str:
+        if not self.enabled:
+            return ""
+        # GEMINI_MODEL이 환경변수로 변경될 수 있으므로 매 호출시 URL 재생성
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{GEMINI_MODEL}:generateContent?key={self.api_key}"
+        )
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": 0.7
+            }
+        }
+        try:
+            res = requests.post(url, json=payload, timeout=60)
+            res.raise_for_status()
+            candidates = res.json().get("candidates", [])
+            if candidates:
+                return candidates[0]["content"]["parts"][0]["text"].strip()
+            return ""
+        except Exception as e:
+            print(f"⚠️ Gemini API 오류: {e}")
+            return ""
+
+    def edit_title(self, title_ko: str, title_ja: str) -> str:
+        """제목 SEO 편집 - 핵심 키워드 앞배치, 30자 내외"""
+        if not self.enabled:
+            return title_ko
+
+        prompt = f"""당신은 영상/카메라 전문 미디어의 SEO 에디터입니다.
+
+일본어 원제: {title_ja}
+번역된 제목: {title_ko}
+
+구글 검색 최적화된 한국어 제목을 작성하세요.
+
+규칙:
+1. 핵심 제품명/브랜드명 반드시 포함 (Sony, Canon, DJI, Blackmagic, DaVinci 등 원문 표기 유지)
+2. 검색 핵심 키워드를 앞쪽에 배치
+3. 자연스러운 한국어 (직역체, 어색한 조사 금지)
+4. 30자 내외 (최대 40자)
+5. 제목만 출력 (설명, 따옴표, 번호 없음)"""
+
+        result = self._call_api(prompt, max_tokens=100)
+        if result:
+            result = re.sub(r'^[\d\.\)\-\s"\'「」]+', '', result).strip().strip('"\'「」')
+            print(f"   ✏️ SEO 제목: {result}")
+            return result
+        return title_ko
+
+    def edit_content(self, content_ko: str) -> str:
+        """본문 SEO 편집 - 직역체 윤문, 전문용어 보정, HTML 태그 유지"""
+        if not self.enabled or not content_ko:
+            return content_ko
+
+        if len(content_ko) <= 3000:
+            return self._edit_chunk(content_ko)
+
+        # 장문은 <p> 태그 기준 청크 분할
+        chunks = self._split_html_chunks(content_ko, max_chars=3000)
+        edited_chunks = []
+        for i, chunk in enumerate(chunks):
+            print(f"   📝 Gemini 편집 중... ({i+1}/{len(chunks)})")
+            edited = self._edit_chunk(chunk)
+            edited_chunks.append(edited if edited else chunk)
+            time.sleep(1)
+        return "\n".join(edited_chunks)
+
+    def _edit_chunk(self, html_chunk: str) -> str:
+        prompt = f"""당신은 영상/카메라 전문 미디어의 한국어 에디터입니다.
+
+아래는 일본어 기사를 AI가 번역한 한국어 HTML 본문입니다.
+직역체를 자연스러운 한국어로 윤문하고 SEO를 최적화하세요.
+
+편집 규칙:
+1. HTML 태그(<p>, <h2>, <h3>, <img> 등)는 반드시 그대로 유지
+2. 직역체, 어색한 조사, 일본식 표현을 자연스러운 한국어로 수정
+3. 영상/카메라 전문용어 정확히 표기:
+   - 브랜드명: Sony, Canon, Nikon, DJI, Blackmagic, DaVinci Resolve 등 원문 유지
+   - 해상도: 4K, 8K, Full HD
+   - 프레임레이트: fps, 24p, 60p
+   - 기타: 코덱, 비트레이트, 조리개, 셔터스피드 등 정확한 한국어 사용
+4. 단락 구조와 문장 수 유지 (내용 추가/삭제 금지)
+5. HTML만 출력 (설명 텍스트 없음)
+
+번역된 HTML:
+{html_chunk}"""
+
+        result = self._call_api(prompt, max_tokens=4096)
+        return result if result else html_chunk
+
+    def _split_html_chunks(self, html: str, max_chars: int = 3000) -> list:
+        """<p> 태그 경계 기준으로 HTML 청크 분할"""
+        chunks = []
+        current_chunk = ""
+        parts = re.split(r'(?=<p>)', html)
+        for part in parts:
+            if len(current_chunk) + len(part) > max_chars and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = part
+            else:
+                current_chunk += part
+        if current_chunk:
+            chunks.append(current_chunk)
+        return chunks if chunks else [html]
+
+
+# ==========================================
+# 메인 번역 시스템
+# ==========================================
 class NewsTranslator:
     def __init__(self):
-        self.translator = Translator()
+        self.groq = GroqTranslator()
+        self.gemini = GeminiEditor()
         self.wordpress_api = f"{WORDPRESS_URL}/wp-json/wp/v2"
         self.posted_articles = self.load_posted_articles()
-        
-    def load_posted_articles(self):
+
+    def load_posted_articles(self) -> list:
         if Path(POSTED_ARTICLES_FILE).exists():
             with open(POSTED_ARTICLES_FILE, 'r') as f:
                 try:
@@ -46,80 +343,73 @@ class NewsTranslator:
                 except:
                     return []
         return []
-        
+
     def save_posted_articles(self):
         with open(POSTED_ARTICLES_FILE, 'w') as f:
             json.dump(self.posted_articles, f, indent=2)
-        
-    def fetch_rss_feed(self):
+
+    def fetch_rss_feed(self) -> list:
         """
-        [개선 1] 최신 기사부터 모두 처리 (제한 없음)
+        RSS 피드에서 미게시 기사 조회
+        - 최신순 정렬
+        - 최신 기사가 10건 미만이면 과거 미게시 기사로 채워 항상 최대 10건 반환
         """
         print(f"📡 RSS 피드 확인 중: {PRONEWS_RSS}")
         feed = feedparser.parse(PRONEWS_RSS)
-        
-        all_articles = []
-        print(f"🔍 총 {len(feed.entries)}개의 피드 항목 검색...")
+        print(f"🔍 총 {len(feed.entries)}개 피드 항목 검색...")
 
+        unposted = []
         for entry in feed.entries:
             if not FORCE_UPDATE and entry.link in self.posted_articles:
                 continue
-                
             try:
                 article_date = datetime(*entry.published_parsed[:6])
             except:
                 article_date = datetime.now()
-                
-            all_articles.append({
+
+            unposted.append({
                 'title': entry.title,
                 'link': entry.link,
                 'date': article_date
             })
-        
-        # [개선 1] 최신순 정렬 (역순)
-        all_articles.sort(key=lambda x: x['date'], reverse=True)
-        
-        print(f"✅ 처리할 최신 기사: {len(all_articles)}개 (제한 없음)")
-        return all_articles  # 모든 기사 반환
-        
-    def fetch_full_content(self, url):
-        """
-        [개선 2] 본문 스크래핑 + 불필요한 요소 제거
-        """
+
+        # 최신순 정렬 후 최대 10건 (최신 + 과거 미게시 순서로 자동 채워짐)
+        unposted.sort(key=lambda x: x['date'], reverse=True)
+        target = unposted[:DAILY_LIMIT]
+
+        print(f"✅ 미게시 기사: {len(unposted)}건 → 오늘 처리: {len(target)}건 (최대 {DAILY_LIMIT}건)")
+        return target
+
+    def fetch_full_content(self, url: str):
+        """본문 스크래핑 + 불필요 요소 제거"""
         try:
             print(f"📄 스크래핑: {url}")
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             response = requests.get(url, headers=headers, timeout=15)
             response.raise_for_status()
-            
+
             soup = BeautifulSoup(response.text, 'lxml')
-            
-            # pronews.com의 본문 영역 찾기
-            content_div = soup.find('div', class_='entry-content')
-            if not content_div:
-                content_div = soup.find('div', class_='post-content')
-            if not content_div:
-                content_div = soup.find('div', class_='article-content')
-            if not content_div:
-                content_div = soup.find('article')
-                
+            content_div = (
+                soup.find('div', class_='entry-content') or
+                soup.find('div', class_='post-content') or
+                soup.find('div', class_='article-content') or
+                soup.find('article')
+            )
             if not content_div:
                 return None
 
-            # [개선 2] "원문 게시시각", "출처" 텍스트 제거
-            for elem in content_div.find_all(string=re.compile(r'원문 게시시각:|출처:|原文掲載時刻:|ソース:|バックナンバー|関連キーワード|この記事をシェア|FOLLOW US')):
+            # 불필요 텍스트/섹션 제거
+            for elem in content_div.find_all(string=re.compile(
+                r'원문 게시시각:|출처:|原文掲載時刻:|ソース:|バックナンバー|関連キーワード|この記事をシェア|FOLLOW US'
+            )):
                 parent = elem.find_parent()
                 if parent:
-                    # 해당 문단 전체 제거
                     parent.decompose()
-            
-            # h3 제목이 "백 넘버", "관련 키워드", "이 기사 공유" 등인 섹션 제거
-            for h_tag in content_div.find_all(['h3', 'h2', 'h4']):
-                h_text = h_tag.get_text(strip=True)
-                if any(keyword in h_text for keyword in ['백 넘버', '関連キーワード', 'バックナンバー', 
-                                                          'この記事をシェア', '이 기사 공유', 'FOLLOW US',
-                                                          '関連記事', '관련 기사']):
-                    # h 태그 다음의 모든 형제 요소도 제거 (섹션 전체)
+
+            remove_headings = ['백 넘버', '関連キーワード', 'バックナンバー',
+                               'この記事をシェア', '이 기사 공유', 'FOLLOW US', '関連記事', '관련 기사']
+            for h_tag in content_div.find_all(['h2', 'h3', 'h4']):
+                if any(kw in h_tag.get_text(strip=True) for kw in remove_headings):
                     next_elem = h_tag.find_next_sibling()
                     h_tag.decompose()
                     while next_elem and next_elem.name not in ['h1', 'h2', 'h3', 'h4']:
@@ -127,250 +417,119 @@ class NewsTranslator:
                         next_elem.decompose()
                         next_elem = temp
 
-            # 불필요한 태그 완전 제거
-            for tag in content_div(['script', 'style', 'iframe', 'noscript', 'form', 
-                                   'nav', 'aside', 'footer', 'header']):
+            for tag in content_div(['script', 'style', 'iframe', 'noscript', 'form',
+                                    'nav', 'aside', 'footer', 'header']):
                 tag.decompose()
-            
-            # 소셜 공유 버튼 제거 (클래스명 기반)
-            for social_class in ['social-share', 'share-buttons', 'sns-share', 'social-links', 
-                                'share-links', 'addtoany', 'sharedaddy', 'jp-relatedposts',
-                                'entry-footer', 'post-tags', 'post-categories', 'post-meta']:
-                for elem in content_div.find_all(class_=lambda x: x and any(sc in str(x).lower() for sc in [social_class])):
-                    elem.decompose()
-            
-            # 특정 텍스트 포함 요소 제거
+
+            social_classes = ['social-share', 'share-buttons', 'sns-share', 'social-links',
+                               'share-links', 'addtoany', 'sharedaddy', 'jp-relatedposts',
+                               'entry-footer', 'post-tags', 'post-categories', 'post-meta']
+            for elem in content_div.find_all(class_=lambda x: x and any(
+                sc in ' '.join(x).lower() for sc in social_classes
+            )):
+                elem.decompose()
+
             remove_keywords = [
-                'FOLLOW US', '관련 기사', 'Related', 'Share this', 'Tweet',
-                '뉴스 일람', '칼럼 타이틀', '특집 타이틀', '라이터 목록',
                 'facebook.com', 'twitter.com', 'line.me', 'instagram.com',
                 'youtube.com', 'pronews.jp', 'kr.pronews.com', '/fellowship/',
-                'getpocket.com', 'hatena.ne.jp', '/feed', '/news/', '/columntitle/',
+                'getpocket.com', 'hatena.ne.jp', '/feed', '/columntitle/',
                 '/specialtitle/', '/writer/', 'jp.pronews.com'
             ]
-            
-            # a 태그 제거 (본문 외부 링크)
             for a in list(content_div.find_all('a')):
                 href = a.get('href', '')
                 text = a.get_text(strip=True)
-                
-                # 제거 조건
-                should_remove = any([
-                    any(kw in href.lower() for kw in remove_keywords),
-                    any(kw in text for kw in ['FOLLOW', 'Share', 'Tweet', 'More', 'Read more']),
-                    href.startswith('//www.facebook.com'),
-                    href.startswith('//twitter.com'),
-                    href.startswith('//line.me'),
-                    href.startswith('//'),  # 프로토콜 없는 외부 링크
-                    not text  # 빈 링크
-                ])
-                
-                if should_remove:
+                if any(kw in href.lower() for kw in remove_keywords) or href.startswith('//') or not text:
                     a.decompose()
-            
-            # 빈 태그 제거
-            for tag_name in ['p', 'div', 'span', 'li', 'ul', 'ol']:
+
+            for tag_name in ['p', 'div', 'span', 'li']:
                 for tag in content_div.find_all(tag_name):
                     if not tag.get_text(strip=True) and not tag.find('img'):
                         tag.decompose()
-            
-            # 연속된 br 태그 정리
-            for br in content_div.find_all('br'):
-                next_sibling = br.find_next_sibling()
-                if next_sibling and next_sibling.name == 'br':
-                    br.decompose()
-                    
+
             return str(content_div)
-            
+
         except Exception as e:
-            print(f"⚠️ 실패: {e}")
+            print(f"⚠️ 스크래핑 실패: {e}")
             return None
 
-    def generate_english_slug(self, title):
-        """영문 slug 생성"""
-        # 간단한 키워드 추출 (첫 3-5단어)
-        words = title.split()[:5]
-        
-        # 영문, 숫자만 추출
+    def generate_slug(self, title_ja: str, article_date: datetime) -> str:
+        """영문 slug 생성 (영문 키워드 + 날짜)"""
+        words = title_ja.split()
         slug_words = []
-        for word in words:
-            # 영문자, 숫자, 하이픈만 남김
+        for word in words[:6]:
             cleaned = re.sub(r'[^a-zA-Z0-9\-]', '', word.lower())
             if cleaned and len(cleaned) > 2:
                 slug_words.append(cleaned)
-        
-        # slug 생성
-        if slug_words:
-            slug = '-'.join(slug_words[:4])  # 최대 4단어
-        else:
-            # 영문이 없으면 타임스탬프 기반
-            slug = f"article-{int(time.time())}"
-        
-        # 길이 제한 (50자)
-        return slug[:50]
 
-    def translate_text(self, text):
-        """
-        [개선 2] 번역 + "원문 게시시각", "출처" 제거
-        [개선 4] HTML 헤더 태그 유지
-        """
-        if not text: 
-            return ""
-        
-        try:
-            # BeautifulSoup으로 HTML 파싱
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(text, 'lxml')
-            
-            # h1~h6 태그를 임시로 저장
-            headers = {}
-            for i, tag in enumerate(soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])):
-                placeholder = f"___HEADER_{i}___"
-                headers[placeholder] = {
-                    'tag': tag.name,
-                    'class': tag.get('class', []),
-                    'text': tag.get_text(strip=True)
-                }
-                tag.replace_with(placeholder)
-            
-            # HTML을 텍스트로 변환
-            h = html2text.HTML2Text()
-            h.ignore_links = False
-            h.ignore_images = True
-            h.body_width = 0
-            plain_text = h.handle(str(soup))
-            
-            # [개선 2] "원문 게시시각:", "출처:" 텍스트 제거
-            plain_text = re.sub(r'원문 게시시각:.*?\n', '', plain_text)
-            plain_text = re.sub(r'出典:.*?\n', '', plain_text)
-            plain_text = re.sub(r'ソース:.*?\n', '', plain_text)
-            plain_text = re.sub(r'原文掲載時刻:.*?\n', '', plain_text)
-            
-            # 번역
-            if len(plain_text) > 4000:
-                chunks = [plain_text[i:i+4000] for i in range(0, len(plain_text), 4000)]
-                translated_parts = []
-                for chunk in chunks:
-                    res = self.translator.translate(chunk, src='ja', dest='ko')
-                    translated_parts.append(res.text)
-                    time.sleep(1)
-                translated_text = "\n\n".join(translated_parts)
-            else:
-                result = self.translator.translate(plain_text, src='ja', dest='ko')
-                time.sleep(0.5)
-                translated_text = result.text
-            
-            # 헤더 태그 복원
-            for placeholder, header_info in headers.items():
-                tag_name = header_info['tag']
-                classes = ' '.join(header_info['class']) if header_info['class'] else ''
-                
-                # 플레이스홀더를 찾아서 번역
-                if placeholder in translated_text:
-                    # 원본 텍스트도 번역
-                    try:
-                        translated_header = self.translator.translate(header_info['text'], src='ja', dest='ko').text
-                        time.sleep(0.3)
-                    except:
-                        translated_header = header_info['text']
-                    
-                    # HTML 태그로 복원
-                    if classes:
-                        replacement = f'<{tag_name} class="{classes}">{translated_header}</{tag_name}>'
-                    else:
-                        replacement = f'<{tag_name}>{translated_header}</{tag_name}>'
-                    
-                    translated_text = translated_text.replace(placeholder, replacement)
-            
-            return translated_text
-            
-        except Exception as e:
-            print(f"⚠️ 번역 오류: {e}")
-            return text
+        date_str = article_date.strftime('%Y%m%d')
+        slug = ('-'.join(slug_words[:4]) + f"-{date_str}") if slug_words else f"article-{date_str}-{int(time.time())}"
+        return slug[:60]
 
-    def download_image(self, url):
-        if not url: 
-            return None
-        try:
-            print(f"🖼️ 다운로드: {url}")
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            res = requests.get(url, headers=headers, timeout=15)
-            res.raise_for_status()
-            
-            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
-            timestamp = int(time.time())
-            
-            original_filename = os.path.basename(urlparse(url).path)
-            if '?' in original_filename:
-                original_filename = original_filename.split('?')[0]
-            
-            ext = os.path.splitext(original_filename)[1]
-            if not ext or ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
-                ext = '.jpg'
-            
-            filename = f"pronews_{timestamp}_{url_hash}{ext}"
-            path = Path(f"/tmp/{filename}")
-            
-            with open(path, 'wb') as f:
-                f.write(res.content)
-            
-            print(f"   ✅ {filename}")
-            return path
-        except Exception as e:
-            print(f"⚠️ 실패: {e}")
-        return None
-
-    def upload_media(self, image_path):
-        if not image_path or not image_path.exists(): 
-            return None
-        try:
-            url = f"{self.wordpress_api}/media"
-            with open(image_path, 'rb') as img:
-                files = {'file': (image_path.name, img, 'image/jpeg')}
-                headers = {'Content-Disposition': f'attachment; filename={image_path.name}'}
-                res = requests.post(
-                    url,
-                    auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
-                    headers=headers,
-                    files=files
-                )
-                res.raise_for_status()
-                return res.json()
-        except Exception as e:
-            print(f"⚠️ 업로드 실패: {e}")
-        return None
-
-    def get_main_image_url(self, link):
+    def get_main_image_url(self, link: str):
         try:
             res = requests.get(link, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
             soup = BeautifulSoup(res.text, 'lxml')
-            
             og_img = soup.find('meta', property='og:image')
             if og_img and og_img.get('content'):
                 return og_img['content']
-            
             content = soup.find('div', class_='entry-content')
             if content:
                 img = content.find('img')
                 if img and img.get('src'):
                     img_url = img['src']
-                    if not img_url.startswith('http'):
-                        img_url = urljoin(link, img_url)
-                    return img_url
+                    return img_url if img_url.startswith('http') else urljoin(link, img_url)
         except:
             pass
         return None
 
-    def post_to_wordpress(self, title, content, slug, featured_media_id, original_date):
+    def download_image(self, url: str):
+        if not url:
+            return None
+        try:
+            print(f"🖼️ 이미지 다운로드: {url}")
+            res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15)
+            res.raise_for_status()
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+            original_filename = os.path.basename(urlparse(url).path).split('?')[0]
+            ext = os.path.splitext(original_filename)[1]
+            if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp']:
+                ext = '.jpg'
+            path = Path(f"/tmp/pronews_{int(time.time())}_{url_hash}{ext}")
+            with open(path, 'wb') as f:
+                f.write(res.content)
+            print(f"   ✅ {path.name}")
+            return path
+        except Exception as e:
+            print(f"⚠️ 이미지 다운로드 실패: {e}")
+            return None
+
+    def upload_media(self, image_path: Path):
+        if not image_path or not image_path.exists():
+            return None
+        try:
+            with open(image_path, 'rb') as img:
+                res = requests.post(
+                    f"{self.wordpress_api}/media",
+                    auth=(WORDPRESS_USER, WORDPRESS_APP_PASSWORD),
+                    headers={'Content-Disposition': f'attachment; filename={image_path.name}'},
+                    files={'file': (image_path.name, img, 'image/jpeg')}
+                )
+                res.raise_for_status()
+                return res.json()
+        except Exception as e:
+            print(f"⚠️ 미디어 업로드 실패: {e}")
+            return None
+
+    def post_to_wordpress(self, title: str, content: str, slug: str,
+                           featured_media_id: int, original_date: datetime) -> bool:
         post_data = {
             'title': title,
             'content': content,
             'slug': slug,
             'status': 'publish',
-            'featured_media': featured_media_id if featured_media_id else 0,
+            'featured_media': featured_media_id or 0,
             'date': original_date.strftime('%Y-%m-%dT%H:%M:%S')
         }
-        
         try:
             res = requests.post(
                 f"{self.wordpress_api}/posts",
@@ -378,62 +537,68 @@ class NewsTranslator:
                 json=post_data
             )
             res.raise_for_status()
-            post_info = res.json()
-            print(f"✨ 게시 성공! {post_info['link']}")
+            print(f"✨ 게시 성공: {res.json()['link']}")
             return True
         except Exception as e:
-            print(f"❌ 실패: {e}")
-            if hasattr(e, 'response'):
-                print(f"   {e.response.text[:200]}")
+            print(f"❌ 게시 실패: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"   {e.response.text[:300]}")
             return False
 
-    def process_article(self, article):
+    def process_article(self, article: dict) -> bool:
         print(f"\n{'='*60}")
-        print(f"📰 {article['title'][:50]}...")
+        print(f"📰 {article['title'][:60]}")
         print(f"📅 {article['date'].strftime('%Y-%m-%d %H:%M')}")
         print(f"{'='*60}")
-        
-        # 본문 스크래핑
+
+        # 1. 본문 스크래핑
         raw_html = self.fetch_full_content(article['link'])
         if not raw_html:
+            print("⚠️ 본문 스크래핑 실패 → 스킵")
             return False
-            
-        # 번역
-        print(f"🔄 번역 중...")
-        title_ko = self.translate_text(article['title'])
-        content_ko = self.translate_text(raw_html)
-        
-        # 영문 slug 생성
-        slug = self.generate_english_slug(article['title'])
+
+        # 2. Groq 1차 번역
+        print("🔄 [1단계] Groq 번역 중...")
+        title_ko_raw = self.groq.translate_title(article['title'])
+        content_ko_raw = self.groq.translate_content(raw_html)
+        print(f"   번역 제목: {title_ko_raw}")
+
+        # 3. Gemini 2차 SEO 편집
+        print("✏️  [2단계] Gemini SEO 편집 중...")
+        title_ko = self.gemini.edit_title(title_ko_raw, article['title'])
+        content_ko = self.gemini.edit_content(content_ko_raw)
+
+        # 4. Slug 생성
+        slug = self.generate_slug(article['title'], article['date'])
         print(f"🔗 Slug: {slug}")
-        
-        # 이미지 처리
-        print(f"🔍 이미지...")
-        img_url = self.get_main_image_url(article['link'])
+
+        # 5. 이미지 처리
+        print("🔍 이미지 처리 중...")
         featured_id = 0
-        
+        img_url = self.get_main_image_url(article['link'])
         if img_url:
             local_img = self.download_image(img_url)
             if local_img:
                 media_info = self.upload_media(local_img)
                 if media_info:
                     featured_id = media_info['id']
-                try: 
+                try:
                     local_img.unlink()
-                except: 
+                except:
                     pass
 
-        # 본문 구성
-        final_content = content_ko.replace("\n", "<br>\n")
-        
-        # 원문 링크 (하단)
-        final_content += f"\n\n<hr style='margin:40px 0 20px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
-        final_content += f"<p style='font-size:13px;color:#777;'>"
-        final_content += f"<strong>원문:</strong> <a href='{article['link']}' target='_blank' rel='noopener'>{article['title']}</a>"
-        final_content += f"</p>"
-        
-        # 게시
-        print(f"📤 게시...")
+        # 6. 최종 본문 구성 + 원문 출처
+        final_content = content_ko
+        final_content += (
+            "\n\n<hr style='margin:40px 0 20px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
+            f"<p style='font-size:13px;color:#777;'>"
+            f"<strong>원문:</strong> "
+            f"<a href='{article['link']}' target='_blank' rel='noopener'>{article['title']}</a>"
+            f"</p>"
+        )
+
+        # 7. WordPress 게시
+        print("📤 WordPress 게시 중...")
         if self.post_to_wordpress(title_ko, final_content, slug, featured_id, article['date']):
             if not FORCE_UPDATE:
                 self.posted_articles.append(article['link'])
@@ -443,29 +608,33 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v3")
+        print(f"pronews.jp → prodg.kr 자동 번역 v4")
+        print(f"번역: Groq ({GROQ_MODEL})")
+        print(f"편집: Gemini ({GEMINI_MODEL})")
+        print(f"일일 한도: 최대 {DAILY_LIMIT}건")
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}\n")
-        
+
         if not WORDPRESS_USER or not WORDPRESS_APP_PASSWORD:
-            print("❌ 환경 변수 필요!")
+            print("❌ WP_USER / WP_APP_PASSWORD 환경변수 필요")
             sys.exit(1)
 
         articles = self.fetch_rss_feed()
-        
         if not articles:
-            print("✅ 처리할 기사 없음")
+            print("✅ 처리할 기사 없음 (모두 게시 완료)")
             return
-        
+
         success = 0
-        for article in articles:
+        for i, article in enumerate(articles, 1):
+            print(f"\n[{i}/{len(articles)}]")
             if self.process_article(article):
                 success += 1
             time.sleep(3)
-            
+
         print(f"\n{'='*60}")
-        print(f"🏁 완료: {success}/{len(articles)}개 최신 기사 게시")
+        print(f"🏁 완료: {success}/{len(articles)}건 게시")
         print(f"{'='*60}\n")
+
 
 if __name__ == "__main__":
     bot = NewsTranslator()
