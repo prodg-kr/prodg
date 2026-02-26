@@ -1,11 +1,9 @@
-name: pronews.jp 자동 번역 및 게시 v4
+name: pronews.jp 자동 번역 및 게시 v6
 
 on:
   schedule:
-    # 매일 오전 7시 (KST) = UTC 22:00 (전날)
-    - cron: '0 22 * * *'
+    - cron: '0 22 * * *'  # 매일 KST 07:00
 
-  # 수동 실행
   workflow_dispatch:
     inputs:
       post_status:
@@ -24,16 +22,12 @@ on:
         description: 'Gemini 모델 변경 (기본: gemini-2.5-flash)'
         required: false
         default: 'gemini-2.5-flash'
-      groq_model:
-        description: 'Groq 모델 변경 (기본: llama-3.3-70b-versatile)'
-        required: false
-        default: 'llama-3.3-70b-versatile'
 
 jobs:
   translate-and-post:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # posted_articles.json git 커밋/푸시 권한
+      contents: write
 
     steps:
     - name: 코드 체크아웃
@@ -60,12 +54,10 @@ jobs:
       env:
         WP_USER: ${{ secrets.WP_USER }}
         WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
-        GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         POST_STATUS: ${{ github.event.inputs.post_status || 'publish' }}
         FORCE_UPDATE: ${{ github.event.inputs.force_update || 'false' }}
         GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-2.5-flash' }}
-        GROQ_MODEL: ${{ github.event.inputs.groq_model || 'llama-3.3-70b-versatile' }}
       run: python translate_and_post.py
 
     - name: 게시 기록 저장
