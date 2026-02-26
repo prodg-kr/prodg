@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-pronews.jp 자동 번역 시스템 v4
-파이프라인: 일본어 원문 → Groq 1차 번역 → Gemini Flash 2차 SEO 편집 → WordPress 게시
+pronews.jp 자동 번역 시스템 v5
+파이프라인: 일본어 원문 → Groq 1차 번역 → Gemini 2차 SEO 편집 → WordPress 게시
 
-v3 → v4 변경사항:
-- googletrans 제거 → Groq API (llama-3.3-70b, 무료, 안정적)
-- 2차 SEO 편집 추가 → Gemini 2.5 Flash (무료 플랜)
-- 하루 최대 10건 제한 (최신 기사 우선, 부족하면 과거 미게시 기사로 채움)
-- 모델명 환경변수로 교체 가능 (GROQ_MODEL, GEMINI_MODEL)
+v4 → v5 변경사항:
+- POST_STATUS 환경변수 추가: publish(즉시공개) / draft(임시저장) 선택 가능
+- excerpt(요약문) 자동 생성 → WordPress SEO 메타 활용
+- 중복 방지: posted_articles.json + WordPress API 2중 체크
+- 게시 후 posted_articles.json git 자동 커밋
+- 문체: ~합니다 합쇼체 강제
 """
 
 import os
@@ -35,6 +36,11 @@ PRONEWS_RSS            = "https://jp.pronews.com/feed"
 POSTED_ARTICLES_FILE   = "posted_articles.json"
 FORCE_UPDATE           = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
 DAILY_LIMIT            = 10  # 하루 최대 게시 건수
+
+# 게시 상태: publish(즉시 공개) / draft(임시저장 후 수동 검수)
+# GitHub Actions workflow_dispatch에서 선택 가능
+POST_STATUS      = os.environ.get("POST_STATUS", "publish")
+GENERATE_EXCERPT = True  # WordPress SEO용 요약문 자동 생성
 
 # 모델 설정 (환경변수로 언제든 교체 가능)
 GROQ_MODEL   = os.environ.get("GROQ_MODEL",   "llama-3.3-70b-versatile")
@@ -327,6 +333,40 @@ class GeminiEditor:
             chunks.append(current_chunk)
         return chunks if chunks else [html]
 
+    def generate_excerpt(self, title_ko: str, content_ko: str) -> str:
+        """
+        WordPress SEO용 요약문(excerpt) 생성
+        - 80자 내외, 핵심 키워드 포함
+        - 검색결과 스니펫에 노출되는 문장
+        """
+        if not self.enabled:
+            return ""
+
+        # 본문에서 텍스트만 추출 (HTML 태그 제거)
+        soup = BeautifulSoup(content_ko, 'lxml')
+        plain_text = soup.get_text(separator=' ', strip=True)[:500]
+
+        prompt = f"""당신은 SEO 전문 에디터입니다.
+
+기사 제목: {title_ko}
+본문 일부: {plain_text}
+
+구글 검색결과에 노출될 요약문(메타 디스크립션)을 작성하세요.
+
+규칙:
+1. 80자 내외 (최대 100자)
+2. 핵심 키워드 자연스럽게 포함
+3. 독자가 클릭하고 싶어지는 문장
+4. ~합니다 체로 작성
+5. 요약문만 출력 (설명 없음)"""
+
+        result = self._call_api(prompt, max_tokens=150)
+        if result:
+            result = result.strip().strip('"\'')
+            print(f"   📋 요약문: {result[:50]}...")
+            return result
+        return ""
+
 
 # ==========================================
 # 메인 번역 시스템
@@ -575,15 +615,19 @@ class NewsTranslator:
             print(f"⚠️ git 커밋 실패 (캐시로 대체): {e}")
 
     def post_to_wordpress(self, title: str, content: str, slug: str,
-                           featured_media_id: int, original_date: datetime) -> bool:
+                           featured_media_id: int, original_date: datetime,
+                           excerpt: str = "", status: str = "publish") -> bool:
         post_data = {
             'title': title,
             'content': content,
             'slug': slug,
-            'status': 'publish',
+            'status': status,
             'featured_media': featured_media_id or 0,
             'date': original_date.strftime('%Y-%m-%dT%H:%M:%S')
         }
+        if excerpt:
+            post_data['excerpt'] = excerpt
+
         try:
             res = requests.post(
                 f"{self.wordpress_api}/posts",
@@ -591,7 +635,9 @@ class NewsTranslator:
                 json=post_data
             )
             res.raise_for_status()
-            print(f"✨ 게시 성공: {res.json()['link']}")
+            post_info = res.json()
+            status_label = "📝 임시저장" if status == "draft" else "✨ 게시 성공"
+            print(f"{status_label}: {post_info['link']}")
             return True
         except Exception as e:
             print(f"❌ 게시 실패: {e}")
@@ -629,11 +675,17 @@ class NewsTranslator:
         title_ko = self.gemini.edit_title(title_ko_raw, article['title'])
         content_ko = self.gemini.edit_content(content_ko_raw)
 
-        # 5. Slug 생성
+        # 5. excerpt 생성 (SEO 메타 디스크립션)
+        excerpt = ""
+        if GENERATE_EXCERPT:
+            print("📋 [3단계] excerpt 생성 중...")
+            excerpt = self.gemini.generate_excerpt(title_ko, content_ko)
+
+        # 6. Slug 생성
         slug = self.generate_slug(article['title'], article['date'])
         print(f"🔗 Slug: {slug}")
 
-        # 6. 이미지 처리
+        # 7. 이미지 처리
         print("🔍 이미지 처리 중...")
         featured_id = 0
         img_url = self.get_main_image_url(article['link'])
@@ -658,9 +710,11 @@ class NewsTranslator:
             f"</p>"
         )
 
-        # 8. WordPress 게시
-        print("📤 WordPress 게시 중...")
-        if self.post_to_wordpress(title_ko, final_content, slug, featured_id, article['date']):
+        # 8. WordPress 게시 (publish or draft)
+        status_label = "draft(임시저장)" if POST_STATUS == "draft" else "publish(즉시공개)"
+        print(f"📤 WordPress {status_label} 중...")
+        if self.post_to_wordpress(title_ko, final_content, slug, featured_id,
+                                   article['date'], excerpt=excerpt, status=POST_STATUS):
             if not FORCE_UPDATE:
                 self.posted_articles.append(article['link'])
                 self.save_posted_articles()
@@ -669,9 +723,10 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v4")
+        print(f"pronews.jp → prodg.kr 자동 번역 v5")
         print(f"번역: Groq ({GROQ_MODEL})")
         print(f"편집: Gemini ({GEMINI_MODEL})")
+        print(f"게시: {POST_STATUS.upper()} ({'즉시 공개' if POST_STATUS == 'publish' else '임시저장 → 수동 검수'})")
         print(f"일일 한도: 최대 {DAILY_LIMIT}건")
         print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*60}\n")
