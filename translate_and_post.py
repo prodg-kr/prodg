@@ -76,7 +76,10 @@ class GeminiEngine:
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "maxOutputTokens": max_tokens,
-                "temperature": 0.4
+                "temperature": 0.4,
+                "thinkingConfig": {
+                    "thinkingBudget": 0
+                }
             }
         }
         max_retries = 3
@@ -86,7 +89,20 @@ class GeminiEngine:
                 res.raise_for_status()
                 candidates = res.json().get("candidates", [])
                 if candidates:
-                    return candidates[0]["content"]["parts"][0]["text"].strip()
+                    parts = candidates[0]["content"]["parts"]
+                    # thinking 모델: thought 파트를 건너뛰고 실제 응답 추출
+                    result_text = ""
+                    for part in parts:
+                        if not part.get("thought", False) and "text" in part:
+                            result_text = part["text"]
+                    # fallback: thought 파트만 있는 경우 마지막 text 파트 사용
+                    if not result_text:
+                        for part in reversed(parts):
+                            if "text" in part:
+                                result_text = part["text"]
+                                break
+                    if result_text:
+                        return result_text.strip()
                 print(f"⚠️ Gemini 응답에 candidates 없음 (시도 {attempt+1}/{max_retries})")
             except Exception as e:
                 print(f"⚠️ Gemini API 오류 (시도 {attempt+1}/{max_retries}): {e}")
@@ -104,7 +120,10 @@ class GeminiEngine:
         제목 번역 + SEO 편집 통합
         - 제품명/모델명 절대 잘리지 않도록 보호
         - 제품명 포함 시 50자까지 허용, 일반 제목은 35자 내외
+        - 최소 10자 미만이면 재시도 (품질 검증)
         """
+        MIN_TITLE_LENGTH = 10  # 제목 최소 글자 수
+
         prompt = f"""당신은 영상/카메라 전문 미디어의 SEO 에디터입니다.
 
 일본어 제목: {title_ja}
@@ -112,18 +131,45 @@ class GeminiEngine:
 위 제목을 한국어로 번역하고 구글 SEO에 최적화하세요.
 
 규칙:
-1. Sony, Canon, Nikon, DJI, Blackmagic, NIKKOR, LUMIX, FUJIFILM 등 브랜드명/제품명/모델명은 원문 그대로 유지하고 절대 생략하지 마세요
+1. Sony, Canon, Nikon, DJI, Blackmagic, Sigma, NIKKOR, LUMIX, FUJIFILM 등 브랜드명/제품명/모델명은 원문 그대로 유지하고 절대 생략하지 마세요
 2. 모델 번호(예: NIKKOR Z 70-200mm f/2.8 VR S II)가 있으면 반드시 전체 포함
-3. 검색 핵심 키워드를 앞쪽에 배치
-4. 자연스러운 한국어 (직역체, 어색한 조사 금지)
-5. 제품명 없는 경우 35자 내외, 제품명 포함 시 50자까지 허용
-6. 제목만 출력 (설명, 따옴표, 번호 없음)"""
+3. 제품명에 포함된 특수문자(|, /, -, ., mm, f/ 등)도 원문 그대로 유지하세요 (예: "DG | Art", "f/1.2" 등)
+4. 검색 핵심 키워드를 앞쪽에 배치
+5. 자연스러운 한국어 (직역체, 어색한 조사 금지)
+6. 제품명 없는 경우 35자 내외, 제품명 포함 시 50자까지 허용
+7. 원문의 핵심 정보(제품명, 발표/출시, 이벤트명 등)를 절대 생략하지 마세요
+8. 제목만 출력 (설명, 따옴표, 번호 없음)"""
 
-        result = self._call_api(prompt, max_tokens=150)
+        # 최대 3회 시도 (초기 1회 + 재시도 2회)
+        for attempt in range(3):
+            result = self._call_api(prompt, max_tokens=200)
+            if result:
+                result = re.sub(r'^[\d\.\)\-\s"\'「」【】]+', '', result).strip().strip('"\'「」【】')
+                if len(result) >= MIN_TITLE_LENGTH:
+                    print(f"   📌 번역 제목: {result}")
+                    return result
+                else:
+                    print(f"   ⚠️ 제목이 너무 짧음 ({len(result)}자: '{result}') — 재시도 {attempt+1}/3")
+                    time.sleep(2)
+            else:
+                print(f"   ⚠️ 제목 번역 API 실패 — 재시도 {attempt+1}/3")
+                time.sleep(2)
+
+        # 모든 시도 실패 시 단순 번역 프롬프트로 최종 시도
+        print("   🔄 단순 번역 프롬프트로 최종 시도...")
+        fallback_prompt = f"""다음 일본어 제목을 한국어로 번역하세요. 
+제품명/모델명/브랜드명은 원문 그대로 유지하세요.
+번역된 제목만 출력하세요.
+
+{title_ja}"""
+        result = self._call_api(fallback_prompt, max_tokens=200)
         if result:
             result = re.sub(r'^[\d\.\)\-\s"\'「」【】]+', '', result).strip().strip('"\'「」【】')
-            print(f"   📌 번역 제목: {result}")
-            return result
+            if len(result) >= MIN_TITLE_LENGTH:
+                print(f"   📌 번역 제목 (fallback): {result}")
+                return result
+            print(f"   ❌ fallback도 짧은 제목 반환: '{result}'")
+
         print(f"❌ 제목 번역 실패 — 일본어 원문 반환 방지")
         return ""
 
