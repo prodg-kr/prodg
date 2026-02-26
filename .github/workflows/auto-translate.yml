@@ -9,7 +9,7 @@ on:
       post_status:
         description: '게시 상태: publish(즉시공개) / draft(임시저장)'
         required: false
-        default: 'publish'
+        default: 'draft'
         type: choice
         options:
           - publish
@@ -55,7 +55,7 @@ jobs:
         WP_USER: ${{ secrets.WP_USER }}
         WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        POST_STATUS: ${{ github.event.inputs.post_status || 'publish' }}
+        POST_STATUS: ${{ github.event.inputs.post_status || 'draft' }}
         FORCE_UPDATE: ${{ github.event.inputs.force_update || 'false' }}
         GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-2.5-flash' }}
       run: python translate_and_post.py

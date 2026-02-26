@@ -38,7 +38,7 @@ GEMINI_API_KEY         = os.environ.get("GEMINI_API_KEY")
 PRONEWS_RSS            = "https://jp.pronews.com/feed"
 POSTED_ARTICLES_FILE   = "posted_articles.json"
 FORCE_UPDATE           = os.environ.get("FORCE_UPDATE", "false").lower() == "true"
-DAILY_LIMIT            = 10  # 하루 최대 게시 건수
+DAILY_LIMIT            = 3  # 하루 최대 게시 건수 (Gemini 2.5 Flash 일일 20~50회 제한 고려)
 
 # 게시 상태: publish(즉시공개) / draft(임시저장 후 수동 검수)
 POST_STATUS      = os.environ.get("POST_STATUS", "draft")
