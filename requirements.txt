@@ -2,4 +2,3 @@ requests==2.31.0
 feedparser==6.0.11
 beautifulsoup4==4.12.3
 lxml==5.1.0
-# v6: Groq 제거, Gemini 단일 엔진 (requests로 직접 호출, 별도 패키지 불필요)
