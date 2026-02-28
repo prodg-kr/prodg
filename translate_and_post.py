@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-pronews.jp 자동 번역 시스템 v7
+pronews.jp 자동 번역 시스템 v7.1 (이미지 HTML 유지 패치)
 파이프라인: 일본어 원문 → Gemini 1회 JSON 통합 번역 → WordPress Draft
 
-v6 → v7 변경사항:
-- 모델: gemini-2.5-flash → gemini-2.5-flash-lite (RPM 15, RPD 1,000)
-- 호출 구조: 청크 6~7회 → 기사당 1회 JSON 통합 (TPM 절감, 처리량 극대화)
+v6 → v7.1 변경사항:
+- fetch_full_content 반환값 str(content_div) 변경 (본문 이미지 유지)
+- 번역 프롬프트 HTML 태그 유지 지시 및 글자수(15000) 한도 확장
+- 모델: gemini-2.5-flash-lite (RPM 15, RPD 1,000)
+- 호출 구조: 기사당 1회 JSON 통합 (TPM 절감, 처리량 극대화)
 - 재번역: 일본어 잔존 시 최대 1회 추가 (총 2회 상한)
-- Slug: API 호출 → 정규식 대체 (호출 수 절약)
+- Slug: 정규식 대체
 - 429 처리: 지수 백오프 후 즉시 런 종료, 미기록 → 다음 런 자동 이월
 - 일본어 잔존 스킵 제거: 경고 후 무조건 게시
-- 실행 모드 분리:
-    schedule          → 최신 우선 + 부족분 아카이브로 채워 항상 10건
-    workflow_dispatch  → 아카이브 오래된 순 10건 (블로그 채우기 모드)
-- 아카이브 크롤링: /news/page/N/ 페이지네이션으로 과거 기사 수집
+- 실행 모드 분리: schedule(최신 우선), workflow_dispatch(아카이브 우선)
+- 아카이브 크롤링: /news/page/N/ 페이지네이션
 - API 호출 간격: 7초 / 기사 간 대기: 10초
 - POST_STATUS 기본값: draft
 """
@@ -58,13 +58,6 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 # Gemini 통합 엔진
 # ==========================================
 class GeminiEngine:
-    """
-    기사당 1회 JSON 통합 호출
-    - 제목+본문+excerpt+TL;DR 한 번에 처리
-    - 429 즉시 런 종료 + 미기록 → 다음 런 이월
-    - 재번역 최대 1회 (총 2회 상한)
-    """
-
     def __init__(self):
         self.api_key         = GEMINI_API_KEY
         if not self.api_key:
@@ -73,7 +66,7 @@ class GeminiEngine:
         self.last_call_time  = 0.0
         self.rate_limit_hit  = False
 
-    def _call_api(self, prompt: str, max_tokens: int = 4096) -> str:
+    def _call_api(self, prompt: str, max_tokens: int = 8192) -> str:
         if self.rate_limit_hit:
             return ""
 
@@ -131,62 +124,59 @@ class GeminiEngine:
         return ""
 
     def translate_article(self, title_ja: str, body_text: str) -> dict:
-        """
-        1회 JSON 통합 호출:
-        제목 번역 + 본문 번역 + excerpt + TL;DR
-        """
         prompt = f"""당신은 영상/카메라 전문 미디어의 한국어 에디터입니다.
-아래 일본어 기사를 한국어로 번역·편집하여 JSON으로만 출력하세요.
+아래 일본어 기사(HTML)를 한국어로 번역·편집하여 JSON으로만 출력하세요.
 
 === 일본어 원문 ===
 제목: {title_ja}
 
 본문:
-{body_text[:6000]}
+{body_text[:15000]}
 
 === 번역 규칙 ===
 1. 일본어(히라가나·가타카나·한자)를 완전히 한국어로 번역
 2. 문체: 반드시 '~합니다', '~했습니다', '~입니다' 합쇼체 통일
 3. 브랜드명·모델명 원문 유지: Sony, Canon, Nikon, DJI, Blackmagic, Sigma 등
 4. 해상도: 4K, 8K, Full HD / 프레임레이트: fps, 24p, 60p
-5. 기계 번역 느낌 없이 사람이 쓴 듯 자연스럽게 (Google SEO·AdSense 품질 기준)
+5. ★중요★: 본문에 포함된 <img>, <figure>, <iframe> 등의 HTML 미디어 태그와 속성(src, alt 등)은 절대 삭제하거나 수정하지 말고 제자리에 그대로 유지하세요.
+6. 기계 번역 느낌 없이 사람이 쓴 듯 자연스럽게 (Google SEO·AdSense 품질 기준)
 
 === 출력 JSON 규칙 ===
 - title: SEO 최적화 제목 (브랜드명·모델명 필수 포함, 최대 50자)
-- content: 번역 본문 (<p> 태그로 단락 구분)
+- content: 번역 본문 (원본 HTML 구조 및 이미지 태그 완벽 유지)
 - excerpt: 구글 스니펫용 요약 (80~100자, 합쇼체)
 - tldr: 핵심 요약 3~4항목 (<ul><li> HTML, 합쇼체)
 - 마크다운 백틱 없이 JSON만 출력
 
 {{
   "title": "SEO 제목",
-  "content": "<p>본문</p>",
+  "content": "<p>본문</p> <figure><img src='...'></figure>",
   "excerpt": "요약문",
   "tldr": "<ul><li>요약1</li><li>요약2</li><li>요약3</li></ul>"
 }}"""
 
-        result = self._call_api(prompt, max_tokens=4096)
+        result = self._call_api(prompt, max_tokens=8192)
         if not result:
             return {}
 
         try:
             clean = re.sub(r'```(?:json)?', '', result).strip().rstrip('`').strip()
-            match = re.search(r'\{.*\}', clean, re.DOTALL)
+            match = re.search(r'(\{.*\})', clean, re.DOTALL)
             if match:
-                return json.loads(match.group())
+                return json.loads(match.group(1))
         except Exception as e:
             print(f"⚠️ JSON 파싱 실패: {e} | 원문: {result[:200]}")
 
         return {}
 
     def retranslate_content(self, content_ko: str) -> str:
-        """일본어 잔존 시 재번역 1회"""
-        prompt = f"""아래 한국어 본문에 일본어가 섞여 있습니다.
+        prompt = f"""아래 한국어 본문(HTML 포함)에 일본어가 섞여 있습니다.
 일본어 부분을 자연스러운 한국어 합쇼체로 번역하고 전체 본문을 반환하세요.
-HTML 태그 유지. 본문만 출력:
+★중요★ <img>, <figure> 등 모든 HTML 태그와 속성은 절대 건드리지 말고 그대로 유지할 것. 
+본문만 출력:
 
-{content_ko[:5000]}"""
-        result = self._call_api(prompt, max_tokens=4096)
+{content_ko[:15000]}"""
+        result = self._call_api(prompt, max_tokens=8192)
         return result if result else content_ko
 
     def _has_japanese(self, text: str) -> bool:
@@ -216,11 +206,7 @@ class NewsTranslator:
         with open(POSTED_ARTICLES_FILE, 'w') as f:
             json.dump(self.posted_articles, f, indent=2)
 
-    # ==========================================
-    # 기사 수집
-    # ==========================================
     def fetch_rss_articles(self) -> list:
-        """RSS 최신 기사 수집"""
         print(f"📡 RSS 피드 확인: {PRONEWS_RSS}")
         feed = feedparser.parse(PRONEWS_RSS)
         articles = []
@@ -241,15 +227,10 @@ class NewsTranslator:
         return articles
 
     def fetch_archive_articles(self, need: int, oldest_first: bool = False) -> list:
-        """
-        /news/page/N/ 페이지네이션으로 과거 기사 수집
-        oldest_first=True  → 수동 실행 (오래된 순)
-        oldest_first=False → 자동 실행 보충 (최신순)
-        """
         print(f"📚 아카이브 크롤링 (필요: {need}건, 오래된순: {oldest_first})...")
         collected = []
         seen_links = set()
-        page = 1 if not oldest_first else ARCHIVE_MAX_PAGES  # 오래된 순이면 뒤 페이지부터
+        page = 1 if not oldest_first else ARCHIVE_MAX_PAGES
 
         while len(collected) < need * 3 and 1 <= page <= ARCHIVE_MAX_PAGES:
             url = f"{PRONEWS_ARCHIVE_BASE}/{page}/"
@@ -262,14 +243,13 @@ class NewsTranslator:
                 soup = BeautifulSoup(res.text, 'lxml')
                 found = []
 
-                # article 태그 기반 파싱
                 for article in soup.find_all('article'):
                     a_tag = article.find('a', href=True)
                     if not a_tag:
                         continue
                     link = a_tag['href']
                     if not link.startswith('http'):
-                        link = urljoin("https://jp.pronews.com", link)
+                        link = urljoin("[https://jp.pronews.com](https://jp.pronews.com)", link)
                     if '/news/' not in link or link in seen_links:
                         continue
 
@@ -290,12 +270,11 @@ class NewsTranslator:
 
                     found.append({'title': title, 'link': link, 'date': article_date, 'source': 'archive'})
 
-                # article 태그 없으면 URL 패턴으로 파싱
                 if not found:
                     for a in soup.find_all('a', href=True):
                         href = a['href']
                         if not href.startswith('http'):
-                            href = urljoin("https://jp.pronews.com", href)
+                            href = urljoin("[https://jp.pronews.com](https://jp.pronews.com)", href)
                         if re.search(r'/news/\d{10,}', href) and href not in seen_links:
                             title = a.get_text(strip=True)
                             if title and len(title) > 5:
@@ -322,11 +301,6 @@ class NewsTranslator:
         return result
 
     def get_articles_to_process(self) -> list:
-        """
-        실행 모드별 기사 수집
-        - 자동(schedule): RSS 최신 우선 + 아카이브 보충 → 항상 10건
-        - 수동(workflow_dispatch): 아카이브 오래된 순 10건
-        """
         if IS_SCHEDULED:
             print("🕐 자동 실행: 최신 우선 + 아카이브 보충")
             rss = self.fetch_rss_articles()
@@ -347,11 +321,7 @@ class NewsTranslator:
         print(f"✅ 처리 대상: {len(target)}건")
         return target
 
-    # ==========================================
-    # 콘텐츠 처리
-    # ==========================================
     def fetch_full_content(self, url: str) -> str:
-        """본문 스크래핑 → 순수 텍스트 반환 (Gemini 토큰 최소화)"""
         try:
             print(f"📄 스크래핑: {url}")
             res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}, timeout=15)
@@ -367,11 +337,7 @@ class NewsTranslator:
             if not content_div:
                 return ""
 
-            # ▼ 특성 이미지 중복 방지: 본문 상단 메인 이미지 제거
-            # og:image로 특성 이미지를 별도 등록하므로 본문 내 중복 제거
             removed = False
-
-            # 1순위: pronews.jp 메인 비주얼 영역 클래스 직접 제거
             for mv_class in ['articleBody-mv', 'article-mv', 'post-thumbnail',
                              'entry-thumbnail', 'article-eye-catch']:
                 mv_area = content_div.find(class_=mv_class)
@@ -381,7 +347,6 @@ class NewsTranslator:
                     removed = True
                     break
 
-            # 2순위: 본문 첫 번째 직계 자식이 figure/img/picture면 제거
             if not removed:
                 first_child = content_div.find(recursive=False)
                 if first_child and first_child.name in ['figure', 'picture']:
@@ -391,11 +356,11 @@ class NewsTranslator:
                     first_child.decompose()
                     print("🗑️ 본문 최상단 img 제거")
                 elif first_child and first_child.name in ['div', 'p']:
-                    # div/p 안에 img만 있는 경우
                     inner = first_child.find_all(recursive=False)
                     if len(inner) == 1 and inner[0].name in ['img', 'figure', 'picture']:
                         first_child.decompose()
                         print("🗑️ 본문 최상단 이미지 래퍼 제거")
+
             for elem in content_div.find_all(string=re.compile(
                 r'原文掲載時刻:|ソース:|バックナンバー|関連キーワード|この記事をシェア|FOLLOW US'
             )):
@@ -438,14 +403,14 @@ class NewsTranslator:
                     if not tag.get_text(strip=True) and not tag.find('img'):
                         tag.decompose()
 
-            return content_div.get_text(separator='\n', strip=True)
+            # HTML 구조 그대로 반환하도록 변경 (기존 get_text 삭제)
+            return str(content_div)
 
         except Exception as e:
             print(f"⚠️ 스크래핑 실패: {e}")
             return ""
 
     def generate_seo_slug(self, title_ko: str, article_date: datetime) -> str:
-        """정규식 Slug 생성 (API 호출 없음)"""
         slug = re.sub(r'[^a-zA-Z0-9\s]', '', title_ko)
         slug = slug.lower().strip().replace(' ', '-')
         slug = re.sub(r'-+', '-', slug).strip('-')
@@ -566,9 +531,6 @@ class NewsTranslator:
                 print(f"   {e.response.text[:300]}")
             return False
 
-    # ==========================================
-    # 기사 처리
-    # ==========================================
     def process_article(self, article: dict) -> bool:
         print(f"\n{'='*60}")
         print(f"📰 {article['title'][:70]}")
@@ -579,20 +541,17 @@ class NewsTranslator:
             print("🛑 429 플래그 → 다음 런 이월")
             return False
 
-        # 중복 체크
         if not FORCE_UPDATE and self.is_already_posted_on_wp(article['link']):
             if article['link'] not in self.posted_articles:
                 self.posted_articles.append(article['link'])
                 self.save_posted_articles()
             return False
 
-        # 1. 본문 스크래핑 (순수 텍스트)
         body_text = self.fetch_full_content(article['link'])
         if not body_text:
             print("⚠️ 본문 스크래핑 실패 → 스킵")
             return False
 
-        # 2. Gemini 1회 JSON 통합 번역
         print("🔄 [1단계] Gemini 번역 (1회 JSON 통합)...")
         translated = self.gemini.translate_article(article['title'], body_text)
 
@@ -606,19 +565,16 @@ class NewsTranslator:
         tldr_html = translated.get('tldr', '')
         print(f"   📌 제목: {title_ko}")
 
-        # 3. 일본어 잔존 시 재번역 1회 (경고 후 무조건 게시)
         if self.gemini._has_japanese(content_ko):
             print("   ⚠️ 일본어 잔존 → 재번역 1회 시도...")
             content_ko = self.gemini.retranslate_content(content_ko)
             if self.gemini._has_japanese(content_ko):
                 print("   ⚠️ 재번역 후 일부 잔존 → 경고 후 게시 진행")
 
-        # 4. Slug (정규식, API 호출 없음)
         slug = self.generate_seo_slug(title_ko, article['date'])
         print(f"🔗 Slug: {slug}")
 
-        # 5. 이미지
-        print("🔍 이미지 처리 중...")
+        print("🔍 특성 이미지(Featured Image) 처리 중...")
         featured_id = 0
         img_url = self.get_main_image_url(article['link'])
         if img_url:
@@ -632,7 +588,6 @@ class NewsTranslator:
                 except:
                     pass
 
-        # 6. 최종 본문 구성
         final_content = ""
         if tldr_html:
             final_content += (
@@ -648,7 +603,6 @@ class NewsTranslator:
             f"<a href='{article['link']}' target='_blank' rel='noopener'>{article['title']}</a></p>"
         )
 
-        # 7. WordPress 게시
         label = "draft(임시저장)" if POST_STATUS == "draft" else "publish(즉시공개)"
         print(f"📤 [2단계] WordPress {label} 중...")
         if self.post_to_wordpress(title_ko, final_content, slug, featured_id,
@@ -661,7 +615,7 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v7")
+        print(f"pronews.jp → prodg.kr 자동 번역 v7.1")
         print(f"엔진: {GEMINI_MODEL} | 호출: 기사당 1회 JSON 통합")
         print(f"모드: {'자동 (최신→아카이브 보충)' if IS_SCHEDULED else '수동 (아카이브 오래된 순)'}")
         print(f"게시: {POST_STATUS.upper()} | 일일 한도: {DAILY_LIMIT}건")
@@ -672,7 +626,6 @@ class NewsTranslator:
             print("❌ WP_USER / WP_APP_PASSWORD 환경변수 필요")
             sys.exit(1)
 
-        # API 키 검증
         print("🔑 Gemini API 키 검증...")
         test = self.gemini._call_api("テスト를 한국어로 번역:", max_tokens=30)
         if not test:
