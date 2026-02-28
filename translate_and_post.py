@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-pronews.jp 자동 번역 시스템 v7.1 (이미지 HTML 유지 패치)
+pronews.jp 자동 번역 시스템 v7.2 (노이즈 제거 및 HTML 유지 완벽 패치)
 파이프라인: 일본어 원문 → Gemini 1회 JSON 통합 번역 → WordPress Draft
 
-v6 → v7.1 변경사항:
+v6 → v7.2 변경사항:
 - fetch_full_content 반환값 str(content_div) 변경 (본문 이미지 유지)
 - 번역 프롬프트 HTML 태그 유지 지시 및 글자수(15000) 한도 확장
+- 사이드바, SNS 공유버튼, 관련기사 등 불필요한 UI(Noise) 완벽 제거
 - 모델: gemini-2.5-flash-lite (RPM 15, RPD 1,000)
 - 호출 구조: 기사당 1회 JSON 통합 (TPM 절감, 처리량 극대화)
 - 재번역: 일본어 잔존 시 최대 1회 추가 (총 2회 상한)
@@ -328,7 +329,10 @@ class NewsTranslator:
             res.raise_for_status()
             soup = BeautifulSoup(res.text, 'lxml')
 
+            # 1. 본문 영역을 더 정밀하게 찾기
             content_div = (
+                soup.find('div', class_='articleBody-inner') or
+                soup.find('div', class_='articleBody') or
                 soup.find('div', class_='entry-content') or
                 soup.find('div', class_='post-content') or
                 soup.find('div', class_='article-content') or
@@ -336,6 +340,17 @@ class NewsTranslator:
             )
             if not content_div:
                 return ""
+
+            # =========================================================
+            # [추가] 2. 지저분한 웹사이트 껍데기(UI, 관련기사, 메뉴) 강제 삭제
+            noise_classes = [
+                'articleAside', 'mainLayout-side', 'articleShareSticky', 
+                'articleShare', 'relatedKeyword', 'relatedArticle', 'prnbox'
+            ]
+            for noise_class in noise_classes:
+                for noise in content_div.find_all(class_=noise_class):
+                    noise.decompose()
+            # =========================================================
 
             removed = False
             for mv_class in ['articleBody-mv', 'article-mv', 'post-thumbnail',
@@ -615,7 +630,7 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v7.1")
+        print(f"pronews.jp → prodg.kr 자동 번역 v7.2")
         print(f"엔진: {GEMINI_MODEL} | 호출: 기사당 1회 JSON 통합")
         print(f"모드: {'자동 (최신→아카이브 보충)' if IS_SCHEDULED else '수동 (아카이브 오래된 순)'}")
         print(f"게시: {POST_STATUS.upper()} | 일일 한도: {DAILY_LIMIT}건")
