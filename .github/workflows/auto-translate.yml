@@ -2,7 +2,7 @@ name: pronews.jp 자동 번역 및 게시 v7
 
 on:
   schedule:
-    - cron: '0 22 * * *'  # 매일 KST 07:00
+    - cron: '0 22 * * *'  # 매일 KST 07:00 (UTC 22:00)
 
   workflow_dispatch:
     inputs:
@@ -27,7 +27,7 @@ jobs:
   translate-and-post:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: write # Python 스크립트에서 git push를 하기 위해 필수
 
     steps:
     - name: 코드 체크아웃
@@ -42,14 +42,6 @@ jobs:
     - name: 의존성 설치
       run: pip install -r requirements.txt
 
-    - name: 게시 기록 복원
-      uses: actions/cache@v4
-      with:
-        path: posted_articles.json
-        key: posted-articles-${{ github.run_id }}
-        restore-keys: |
-          posted-articles-
-
     - name: 번역 및 게시 실행
       env:
         WP_USER: ${{ secrets.WP_USER }}
@@ -60,13 +52,6 @@ jobs:
         GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-2.5-flash-lite' }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: python translate_and_post.py
-
-    - name: 게시 기록 저장
-      uses: actions/cache/save@v4
-      if: always()
-      with:
-        path: posted_articles.json
-        key: posted-articles-${{ github.run_id }}
 
     - name: 완료 알림
       if: always()
