@@ -20,6 +20,7 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import hashlib
 import re
+import html
 
 # ==========================================
 # 설정
@@ -548,6 +549,120 @@ class NewsTranslator:
         except Exception as e:
             print(f"⚠️ git 커밋 실패: {e}")
 
+
+    def _strip_html(self, html_text: str) -> str:
+        try:
+            soup = BeautifulSoup(html_text or "", "lxml")
+            text = soup.get_text(" ", strip=True)
+            return re.sub(r"\s+", " ", text).strip()
+        except Exception:
+            return (html_text or "").strip()
+
+    def build_lede_summary(self, excerpt: str, tldr_html: str) -> str:
+        """
+        2~3문장 요약을 본문 최상단에 넣기 위한 텍스트 생성.
+        우선순위: excerpt → tldr(텍스트화) → 빈 문자열
+        """
+        base = (excerpt or "").strip()
+        if not base:
+            base = self._strip_html(tldr_html)
+        if not base:
+            return ""
+
+        # 문장 2~3개만 잘라내기 (한/영 혼용 대응)
+        # 구분자: . ! ? … 그리고 '다.' 같은 한국어 종결도 포함
+        parts = re.split(r"(?<=[\.\!\?\u2026])\s+|(?<=다\.)\s+|(?<=요\.)\s+", base)
+        parts = [p.strip() for p in parts if p.strip()]
+        summary = " ".join(parts[:3]).strip()
+        # 너무 길면 컷
+        if len(summary) > 380:
+            summary = summary[:377].rstrip() + "..."
+        return summary
+
+    def fetch_recent_posts(self, per_page: int = 50) -> list:
+        """
+        내부링크 후보를 만들기 위해 최근 게시글을 가져온다.
+        실패하면 빈 리스트 반환.
+        """
+        try:
+            res = requests.get(
+                f"{self.wordpress_api}/posts",
+                params={"per_page": per_page, "status": "publish"},
+                timeout=10
+            )
+            if res.status_code != 200:
+                return []
+            return res.json()
+        except Exception:
+            return []
+
+    def pick_related_posts(self, title: str, limit: int = 3) -> list:
+        """
+        매우 단순한 토큰 겹침 기반 관련 글 선택(빠르고 안정적).
+        """
+        posts = self.fetch_recent_posts(per_page=60)
+        if not posts:
+            return []
+
+        # 토큰화: 영문/숫자/한글 단어
+        def tokens(s: str) -> set:
+            s = (s or "").lower()
+            return set(re.findall(r"[a-z0-9]+|[가-힣]{2,}", s))
+
+        t_tokens = tokens(title)
+        if not t_tokens:
+            return []
+
+        scored = []
+        for p in posts:
+            p_title = self._strip_html(p.get("title", {}).get("rendered", ""))
+            p_link = p.get("link", "")
+            if not p_link:
+                continue
+            p_tokens = tokens(p_title)
+            score = len(t_tokens & p_tokens)
+            if score <= 0:
+                continue
+            scored.append((score, p_title, p_link))
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        picked = []
+        used_links = set()
+        for _, pt, pl in scored:
+            if pl in used_links:
+                continue
+            used_links.add(pl)
+            picked.append({"title": pt, "link": pl})
+            if len(picked) >= limit:
+                break
+        return picked
+
+    def build_internal_links_html(self, title: str, limit: int = 3) -> str:
+        related = self.pick_related_posts(title, limit=limit)
+        # fallback: 카테고리/홈 링크만
+        pronews_category_url = f"{WORDPRESS_URL}/category/pronews/"
+        if not related:
+            return (
+                "<hr style='margin:32px 0 18px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
+                "<h3 style='margin:0 0 10px 0;'>관련 글</h3>\n"
+                "<ul>\n"
+                f"<li><a href='{pronews_category_url}'>proNEWS 카테고리</a></li>\n"
+                f"<li><a href='{WORDPRESS_URL}/'>홈</a></li>\n"
+                "</ul>\n"
+            )
+
+        items = "\n".join(
+            f"<li><a href='{html.escape(r['link'])}'>{html.escape(r['title'])}</a></li>"
+            for r in related
+        )
+        return (
+            "<hr style='margin:32px 0 18px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
+            "<h3 style='margin:0 0 10px 0;'>관련 글</h3>\n"
+            "<ul>\n"
+            f"{items}\n"
+            "</ul>\n"
+        )
+
     def post_to_wordpress(self, title: str, content: str, slug: str,
                            featured_media_id: int, original_date: datetime,
                            excerpt: str = "", status: str = "draft") -> bool:
@@ -636,7 +751,17 @@ class NewsTranslator:
                 except:
                     pass
 
+        # ── SEO 보강: 2~3문장 요약 + 내부링크 ──
+        lede_summary = self.build_lede_summary(excerpt, tldr_html)
+        internal_links_html = self.build_internal_links_html(title_ko, limit=3)
+
         final_content = ""
+        if lede_summary:
+            final_content += (
+                f"<p style='font-size:15px;line-height:1.7;color:#222;margin:0 0 18px 0;'>"
+                f"{lede_summary}</p>\n"
+            )
+
         if tldr_html:
             final_content += (
                 '<div style="background:#f8f9fa;padding:20px;border-radius:8px;'
@@ -644,12 +769,15 @@ class NewsTranslator:
                 '<h3 style="margin-top:0;color:#0056b3;">💡 핵심 요약</h3>\n'
                 f'{tldr_html}\n</div>\n\n'
             )
+
         final_content += content_ko
+        final_content += "\n\n" + internal_links_html
         final_content += (
             "\n\n<hr style='margin:40px 0 20px 0;border:0;border-top:1px solid #e0e0e0;'>\n"
             f"<p style='font-size:13px;color:#777;'><strong>원문:</strong> "
             f"<a href='{article['link']}' target='_blank' rel='noopener'>{article['title']}</a></p>"
         )
+
 
         label = "draft(임시저장)" if POST_STATUS == "draft" else "publish(즉시공개)"
         print(f"📤 [2단계] WordPress {label} 중...")
@@ -664,7 +792,7 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v7.5.3")
+        print(f"pronews.jp → prodg.kr 자동 번역 v7.6")
         print(f"엔진: {GEMINI_MODEL} | 호출: 기사당 1회 JSON 통합")
         print(f"모드: {'자동 (최신→아카이브 보충)' if IS_SCHEDULED else '수동 (아카이브 오래된 순)'}")
         print(f"게시: {POST_STATUS.upper()} | 일일 한도: {DAILY_LIMIT}건")
