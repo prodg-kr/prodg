@@ -670,7 +670,8 @@ class NewsTranslator:
         post_data = {
             'title': title, 'content': content, 'slug': slug,
             'status': status, 'featured_media': featured_media_id or 0,
-            'date': target_date
+            'date': target_date,
+            'categories': [430]  # proNEWS 카테고리 고정
         }
         if excerpt:
             post_data['excerpt'] = excerpt
@@ -792,7 +793,7 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v7.6")
+        print(f"pronews.jp → prodg.kr 자동 번역 v7.7")
         print(f"엔진: {GEMINI_MODEL} | 호출: 기사당 1회 JSON 통합")
         print(f"모드: {'자동 (최신→아카이브 보충)' if IS_SCHEDULED else '수동 (아카이브 오래된 순)'}")
         print(f"게시: {POST_STATUS.upper()} | 일일 한도: {DAILY_LIMIT}건")
