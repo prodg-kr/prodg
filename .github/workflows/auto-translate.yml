@@ -2,7 +2,7 @@ name: pronews.jp 자동 번역 및 게시 v7
 
 on:
   schedule:
-    - cron: '0 22 * * *'  # 매일 KST 07:00 (UTC 22:00)
+    - cron: '0 21 * * *'  # 매일 KST 06:00 (UTC 21:00)
 
   workflow_dispatch:
     inputs:
@@ -58,4 +58,4 @@ jobs:
       run: |
         echo "✅ 완료: $(date)"
         echo "모드: ${{ github.event_name }}"
-        echo "다음 자동 실행: 내일 오전 7시 (KST)"
+        echo "다음 자동 실행: 내일 오전 6시 (KST)"
