@@ -454,11 +454,52 @@ class NewsTranslator:
             print(f"⚠️ 스크래핑 실패: {e}")
             return "", None
 
-    def generate_seo_slug(self, title_ko: str, article_date: datetime) -> str:
-        slug = re.sub(r'[^a-zA-Z0-9\s]', '', title_ko)
-        slug = slug.lower().strip().replace(' ', '-')
-        slug = re.sub(r'-+', '-', slug).strip('-')
+    def generate_seo_slug(self, title_ko: str, article_date: datetime, title_ja: str = "") -> str:
+        """
+        슬러그 생성 우선순위:
+        1. 한국어 제목에서 영문/숫자 추출
+        2. 없으면 일본어 원문 제목에서 영문/숫자 추출
+        3. 둘 다 없으면 브랜드/모델명 사전 기반 키워드 추출
+        4. 최종 fallback: news-날짜
+        """
         date_str = article_date.strftime('%Y%m%d') if article_date else datetime.now().strftime('%Y%m%d')
+
+        # 브랜드/제품 키워드 사전 (일본어 → 슬러그용 영문)
+        BRAND_SLUG = {
+            'ソニー': 'sony', 'キヤノン': 'canon', 'ニコン': 'nikon',
+            'タムロン': 'tamron', 'シグマ': 'sigma', 'フジフイルム': 'fujifilm',
+            'パナソニック': 'panasonic', 'オリンパス': 'olympus', 'ライカ': 'leica',
+            'ブラックマジック': 'blackmagic', 'アップル': 'apple', 'アドビ': 'adobe',
+            'ゴープロ': 'gopro', 'ドローン': 'drone', 'カメラ': 'camera',
+            'レンズ': 'lens', 'ミラーレス': 'mirrorless', '動画': 'video',
+            '映像': 'video', '写真': 'photo', '撮影': 'shooting',
+        }
+
+        def extract_english(text: str) -> str:
+            """영문·숫자·모델번호 추출"""
+            words = re.findall(r'[a-zA-Z][a-zA-Z0-9]*|[0-9]+[a-zA-Z]+|[a-zA-Z]+[0-9]+', text)
+            # 너무 짧은 단어(1~2글자) 제외, 단 숫자+영문 조합(4K, 8K, R5 등)은 유지
+            filtered = [w.lower() for w in words if len(w) >= 2]
+            return '-'.join(filtered[:6])
+
+        # 1. 한국어 제목에서 영문 추출
+        slug = extract_english(title_ko)
+
+        # 2. 일본어 원문에서 영문 추출
+        if len(slug) < 3 and title_ja:
+            slug = extract_english(title_ja)
+
+        # 3. 브랜드 사전으로 키워드 추출 (일본어 원문 기반)
+        if len(slug) < 3 and title_ja:
+            brand_words = []
+            for ja, en in BRAND_SLUG.items():
+                if ja in title_ja:
+                    brand_words.append(en)
+            if brand_words:
+                slug = '-'.join(brand_words[:3])
+
+        # 4. 최종 fallback
+        slug = re.sub(r'-+', '-', slug).strip('-')
         return f"{slug[:50]}-{date_str}" if len(slug) >= 3 else f"news-{date_str}"
 
     def get_main_image_url(self, link: str):
@@ -735,7 +776,7 @@ class NewsTranslator:
             if self.gemini._has_japanese(content_ko):
                 print("   ⚠️ 재번역 후 일부 잔존 → 경고 후 게시 진행")
 
-        slug = self.generate_seo_slug(title_ko, article['date'])
+        slug = self.generate_seo_slug(title_ko, article['date'], title_ja=article.get('title', ''))
         print(f"🔗 Slug: {slug}")
 
         print("🔍 특성 이미지(Featured Image) 처리 중...")
@@ -793,7 +834,7 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v7.7")
+        print(f"pronews.jp → prodg.kr 자동 번역 v7.8")
         print(f"엔진: {GEMINI_MODEL} | 호출: 기사당 1회 JSON 통합")
         print(f"모드: {'자동 (최신→아카이브 보충)' if IS_SCHEDULED else '수동 (아카이브 오래된 순)'}")
         print(f"게시: {POST_STATUS.upper()} | 일일 한도: {DAILY_LIMIT}건")
