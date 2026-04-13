@@ -413,7 +413,7 @@ class NewsTranslator:
                         print("🗑️ 본문 최상단 이미지 래퍼 제거")
 
             for elem in content_div.find_all(string=re.compile(
-                r'原文掲載時刻:|ソース:|バックナンバー|関連キーワード|この記事をシェア|FOLLOW US'
+                r'原文掲載時刻:|ソース:|バックナンバー|関連キーワード|この記事をシェア|FOLLOW US|画像をクリック|クリックすると拡大|※画像'
             )):
                 parent = elem.find_parent()
                 if parent:
@@ -760,6 +760,28 @@ class NewsTranslator:
                 print("   ⚠️ 재번역 후 일부 잔존 → 경고 후 게시 진행")
 
 
+        # 번역 후 불필요 문구 제거
+        remove_phrases = [
+            '※이미지를 클릭하여 확대', '※ 이미지를 클릭하여 확대',
+            '이미지를 클릭하면 확대됩니다', '클릭하면 확대 표시됩니다',
+            '이미지를 클릭하여 확대하세요', '※이미지 클릭으로 확대',
+        ]
+        for phrase in remove_phrases:
+            content_ko = content_ko.replace(phrase, '')
+
+        # 코멘트 도입부만 남고 내용이 없는 패턴 제거 (BeautifulSoup으로 처리)
+        from bs4 import BeautifulSoup as _BS
+        _soup = _BS(content_ko, 'lxml')
+        _comment_patterns = re.compile(
+            r'.{0,30}(다음과 같이 말했다|이렇게 말했다|다음과 같이 밝혔다|아래와 같이 코멘트했다'
+            r'|다음과 같이 코멘트|이와 같이 말했다|다음과 같이 전했다)\s*[\.。]?\s*$'
+        )
+        for tag in _soup.find_all(['p', 'div']):
+            text = tag.get_text(strip=True)
+            if _comment_patterns.search(text) and len(text) < 80:
+                tag.decompose()
+        content_ko = str(_soup.body or _soup)
+
         # 본문 글자수 체크 (500자 미만 스킵)
         plain_length = len(self._strip_html(content_ko))
         if plain_length < 500:
@@ -824,7 +846,7 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v7.9")
+        print(f"pronews.jp → prodg.kr 자동 번역 v7.10")
         print(f"엔진: {GEMINI_MODEL} | 호출: 기사당 1회 JSON 통합")
         print(f"모드: {'자동 (최신→아카이브 보충)' if IS_SCHEDULED else '수동 (아카이브 오래된 순)'}")
         print(f"게시: {POST_STATUS.upper()} | 일일 한도: {DAILY_LIMIT}건")
