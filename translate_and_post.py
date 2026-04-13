@@ -42,7 +42,7 @@ GITHUB_EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "workflow_dispatch")
 IS_SCHEDULED      = GITHUB_EVENT_NAME == "schedule"
 
 # 게시 상태
-POST_STATUS  = os.environ.get("POST_STATUS", "draft")
+POST_STATUS  = os.environ.get("POST_STATUS", "publish")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 
@@ -115,7 +115,7 @@ class GeminiEngine:
         return ""
 
     def translate_article(self, title_ja: str, body_text: str) -> dict:
-        prompt = f"""당신은 영상/카메라 전문 미디어의 한국어 에디터입니다.
+        prompt = f"""당신은 영상·카메라·디지털 전문 미디어 proDG의 한국어 시니어 에디터입니다.
 아래 일본어 기사(HTML)를 한국어로 번역·편집하여 JSON으로만 출력하세요.
 
 === 일본어 원문 ===
@@ -125,19 +125,25 @@ class GeminiEngine:
 {body_text[:15000]}
 
 === 번역 규칙 ===
-1. 일본어(히라가나·가타카나·한자)를 완전히 한국어로 번역
-2. 문체: 반드시 '~다', '~했다', '~이다' 등 기사 형식의 평어체(해라체/한다체)로 통일
-3. 브랜드명·모델명 원문 유지: Sony, Canon, Nikon, DJI, Blackmagic, Sigma 등
-4. 해상도: 4K, 8K, Full HD / 프레임레이트: fps, 24p, 60p
-5. ★중요★: 본문에 포함된 <img>, <figure>, <iframe> 등의 HTML 미디어 태그와 속성(src, alt 등)은 절대 삭제하거나 수정하지 말고 제자리에 그대로 유지하세요.
-6. 기계 번역 느낌 없이 사람이 쓴 듯 자연스럽게 (Google SEO·AdSense 품질 기준)
+1. 일본어(히라가나·가타카나·한자)를 완전히 한국어로 번역. 일본어가 한 글자도 남으면 안 됨.
+2. 문체: 반드시 '~다', '~했다', '~이다' 등 기사 형식의 평어체로 통일. '~합니다' 금지.
+3. 브랜드명·모델명 표기:
+   - 원문 영문 유지: Sony, Canon, Nikon, DJI, Blackmagic, Sigma, Tamron, Fujifilm 등
+   - タムロン→탐론, ソニー→소니, キヤノン→캐논, ニコン→니콘, パナソニック→파나소닉
+4. 기술 용어: 4K, 8K, Full HD, fps, RAW, ISO, f값, mm 등 원문 그대로 유지
+5. ★절대 금지★: <img>, <figure>, <picture>, <iframe>, <video> 태그와 src·alt·width·height 속성 수정·삭제
+6. 번역 품질 기준:
+   - 기계 번역 티가 나면 안 됨. 한국 전문 기자가 직접 쓴 것처럼 자연스럽게.
+   - 제품 스펙·수치는 정확하게 유지
+   - 문단 구조와 논리 흐름 유지
+   - Google AdSense 고품질 콘텐츠 기준 충족
 
 === 출력 JSON 규칙 ===
-- title: SEO 최적화 제목 (브랜드명·모델명 필수 포함, 최대 50자)
-- content: 번역 본문 (원본 HTML 구조 및 이미지 태그 완벽 유지)
-- excerpt: 구글 스니펫용 요약 (80~100자, 평어체)
-- tldr: 핵심 요약 3~4항목 (<ul><li> HTML, 평어체)
-- 마크다운 백틱 없이 JSON만 출력
+- title: SEO 최적화 제목 (브랜드명·모델명·핵심스펙 포함, 40~55자)
+- content: 번역 본문 (HTML 구조·이미지 태그 완벽 유지, 최소 300자 이상)
+- excerpt: 구글 스니펫용 요약 (핵심 정보 2문장, 80~120자, 평어체)
+- tldr: 핵심 요약 3~4항목 (<ul><li> HTML, 각 항목 구체적 수치·스펙 포함, 평어체)
+- 마크다운 백틱 없이 순수 JSON만 출력
 
 {{
   "title": "SEO 제목",
@@ -455,16 +461,7 @@ class NewsTranslator:
             return "", None
 
     def generate_seo_slug(self, title_ko: str, article_date: datetime, title_ja: str = "") -> str:
-        """
-        슬러그 생성 우선순위:
-        1. 한국어 제목에서 영문/숫자 추출
-        2. 없으면 일본어 원문 제목에서 영문/숫자 추출
-        3. 둘 다 없으면 브랜드/모델명 사전 기반 키워드 추출
-        4. 최종 fallback: news-날짜
-        """
         date_str = article_date.strftime('%Y%m%d') if article_date else datetime.now().strftime('%Y%m%d')
-
-        # 브랜드/제품 키워드 사전 (일본어 → 슬러그용 영문)
         BRAND_SLUG = {
             'ソニー': 'sony', 'キヤノン': 'canon', 'ニコン': 'nikon',
             'タムロン': 'tamron', 'シグマ': 'sigma', 'フジフイルム': 'fujifilm',
@@ -474,31 +471,17 @@ class NewsTranslator:
             'レンズ': 'lens', 'ミラーレス': 'mirrorless', '動画': 'video',
             '映像': 'video', '写真': 'photo', '撮影': 'shooting',
         }
-
         def extract_english(text: str) -> str:
-            """영문·숫자·모델번호 추출"""
             words = re.findall(r'[a-zA-Z][a-zA-Z0-9]*|[0-9]+[a-zA-Z]+|[a-zA-Z]+[0-9]+', text)
-            # 너무 짧은 단어(1~2글자) 제외, 단 숫자+영문 조합(4K, 8K, R5 등)은 유지
             filtered = [w.lower() for w in words if len(w) >= 2]
             return '-'.join(filtered[:6])
-
-        # 1. 한국어 제목에서 영문 추출
         slug = extract_english(title_ko)
-
-        # 2. 일본어 원문에서 영문 추출
         if len(slug) < 3 and title_ja:
             slug = extract_english(title_ja)
-
-        # 3. 브랜드 사전으로 키워드 추출 (일본어 원문 기반)
         if len(slug) < 3 and title_ja:
-            brand_words = []
-            for ja, en in BRAND_SLUG.items():
-                if ja in title_ja:
-                    brand_words.append(en)
+            brand_words = [en for ja, en in BRAND_SLUG.items() if ja in title_ja]
             if brand_words:
                 slug = '-'.join(brand_words[:3])
-
-        # 4. 최종 fallback
         slug = re.sub(r'-+', '-', slug).strip('-')
         return f"{slug[:50]}-{date_str}" if len(slug) >= 3 else f"news-{date_str}"
 
@@ -776,6 +759,13 @@ class NewsTranslator:
             if self.gemini._has_japanese(content_ko):
                 print("   ⚠️ 재번역 후 일부 잔존 → 경고 후 게시 진행")
 
+
+        # 본문 글자수 체크 (500자 미만 스킵)
+        plain_length = len(self._strip_html(content_ko))
+        if plain_length < 500:
+            print(f"⚠️ 본문 너무 짧음 ({plain_length}자 < 500자) → 스킵")
+            return False
+        print(f"   ✅ 본문 길이: {plain_length}자")
         slug = self.generate_seo_slug(title_ko, article['date'], title_ja=article.get('title', ''))
         print(f"🔗 Slug: {slug}")
 
@@ -834,7 +824,7 @@ class NewsTranslator:
 
     def run(self):
         print(f"\n{'='*60}")
-        print(f"pronews.jp → prodg.kr 자동 번역 v7.8")
+        print(f"pronews.jp → prodg.kr 자동 번역 v7.9")
         print(f"엔진: {GEMINI_MODEL} | 호출: 기사당 1회 JSON 통합")
         print(f"모드: {'자동 (최신→아카이브 보충)' if IS_SCHEDULED else '수동 (아카이브 오래된 순)'}")
         print(f"게시: {POST_STATUS.upper()} | 일일 한도: {DAILY_LIMIT}건")
