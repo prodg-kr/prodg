@@ -47,7 +47,7 @@ jobs:
         WP_USER: ${{ secrets.WP_USER }}
         WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        POST_STATUS: ${{ github.event.inputs.post_status || 'draft' }}
+        POST_STATUS: ${{ github.event.inputs.post_status || 'publish' }}
         FORCE_UPDATE: ${{ github.event.inputs.force_update || 'false' }}
         GEMINI_MODEL: ${{ github.event.inputs.gemini_model || 'gemini-2.5-flash-lite' }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
